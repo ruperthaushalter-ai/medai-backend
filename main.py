@@ -1,111 +1,117 @@
+import os
+from datetime import datetime
+from typing import Optional
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from datetime import datetime
-from sqlalchemy import create_engine, Column, Integer, String, JSON, DateTime, ForeignKey
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, relationship
-import os
+from sqlalchemy import create_engine, Column, Integer, String, JSON, DateTime, ForeignKey, text
+from sqlalchemy.orm import sessionmaker, declarative_base, relationship
 
-# Získanie URL z Railway variables
-DATABASE_URL = os.getenv("DATABASE_URL")
+app = FastAPI(title="MedAI Backend (safe)")
 
-if not DATABASE_URL:
-    raise ValueError("DATABASE_URL is not set in environment variables")
-
-# 🔒 SSL spojenie k Railway PostgreSQL
-engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,
-    future=True,
-    connect_args={"sslmode": "require"}
-)
-
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+DATABASE_URL = os.getenv("DATABASE_URL")  # musí byť nastavené v Railway Variables
+engine = None
+SessionLocal = None
 Base = declarative_base()
+db_init_error: Optional[str] = None
 
-# ======== MODELY ========
+# ---------- DB MODELS ----------
 class Patient(Base):
     __tablename__ = "patients"
-
     id = Column(Integer, primary_key=True, index=True)
-    patient_id = Column(String, unique=True, index=True)
+    patient_uid = Column(String, unique=True, index=True)  # napr. "P001"
     first_name = Column(String)
     last_name = Column(String)
     gender = Column(String)
+    created_at = Column(DateTime, default=datetime.utcnow)
     records = relationship("Record", back_populates="patient", cascade="all, delete")
 
 class Record(Base):
     __tablename__ = "records"
-
     id = Column(Integer, primary_key=True, index=True)
     patient_id = Column(Integer, ForeignKey("patients.id"))
-    category = Column(String)
+    category = Column(String)              # "anamneza","vizita","lab","RTG","EKG","USG","liecba","uvahy"
     timestamp = Column(DateTime)
     content = Column(JSON)
     patient = relationship("Patient", back_populates="records")
 
-# ======== FASTAPI INIT ========
-app = FastAPI(title="MedAI Backend", version="1.0")
+class PatientIn(BaseModel):
+    patient_uid: str
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    gender: Optional[str] = None
 
-Base.metadata.create_all(bind=engine)
-
-# ======== SCHEMY ========
-class RecordCreate(BaseModel):
+class RecordIn(BaseModel):
     category: str
     timestamp: datetime
     content: dict
 
-class PatientCreate(BaseModel):
-    patient_id: str
-    first_name: str
-    last_name: str
-    gender: str
+# ---------- LAZY INIT DB (nespadne pri štarte) ----------
+def init_db_once():
+    global engine, SessionLocal, db_init_error
+    if engine is not None:
+        return
+    try:
+        if not DATABASE_URL:
+            raise RuntimeError("DATABASE_URL is not set")
+        engine = create_engine(
+            f"{DATABASE_URL}" + ("" if "sslmode=" in DATABASE_URL else "?sslmode=require"),
+            pool_pre_ping=True,
+            future=True,
+            connect_args={"sslmode": "require"},
+        )
+        SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+        Base.metadata.create_all(bind=engine)
+    except Exception as e:
+        db_init_error = str(e)
 
-# ======== ENDPOINTY ========
 @app.get("/health")
-def health_check():
-    return {"status": "ok"}
+def health():
+    # pokus o jednoduchý SELECT; ukáž chybu namiesto crashu
+    init_db_once()
+    if db_init_error:
+        return {"status": "db_error", "detail": db_init_error}
+    try:
+        with engine.connect() as c:
+            c.execute(text("select 1"))
+        return {"status": "ok"}
+    except Exception as e:
+        return {"status": "db_error", "detail": str(e)}
 
 @app.post("/patients")
-def create_patient(patient: PatientCreate):
-    db = SessionLocal()
-    existing = db.query(Patient).filter_by(patient_id=patient.patient_id).first()
-    if existing:
-        db.close()
-        raise HTTPException(status_code=400, detail="Patient already exists")
-    db_patient = Patient(**patient.dict())
-    db.add(db_patient)
-    db.commit()
-    db.refresh(db_patient)
-    db.close()
-    return db_patient
+def create_patient(p: PatientIn):
+    init_db_once()
+    if db_init_error:
+        raise HTTPException(500, f"DB not ready: {db_init_error}")
+    with SessionLocal() as s:
+        existing = s.query(Patient).filter_by(patient_uid=p.patient_uid).first()
+        if existing:
+            raise HTTPException(400, "Patient already exists")
+        obj = Patient(**p.dict())
+        s.add(obj); s.commit(); s.refresh(obj)
+        return {"id": obj.id, "patient_uid": obj.patient_uid}
 
-@app.post("/patients/{patient_id}/records")
-def add_record(patient_id: str, record: RecordCreate):
-    db = SessionLocal()
-    db_patient = db.query(Patient).filter_by(patient_id=patient_id).first()
-    if not db_patient:
-        db.close()
-        raise HTTPException(status_code=404, detail="Patient not found")
-    db_record = Record(
-        patient_id=db_patient.id,
-        category=record.category,
-        timestamp=record.timestamp,
-        content=record.content
-    )
-    db.add(db_record)
-    db.commit()
-    db.refresh(db_record)
-    db.close()
-    return db_record
+@app.post("/patients/{patient_uid}/records")
+def add_record(patient_uid: str, r: RecordIn):
+    init_db_once()
+    if db_init_error:
+        raise HTTPException(500, f"DB not ready: {db_init_error}")
+    with SessionLocal() as s:
+        pat = s.query(Patient).filter_by(patient_uid=patient_uid).first()
+        if not pat:
+            raise HTTPException(404, "Patient not found")
+        rec = Record(patient_id=pat.id, category=r.category, timestamp=r.timestamp, content=r.content)
+        s.add(rec); s.commit(); s.refresh(rec)
+        return {"id": rec.id, "category": rec.category, "timestamp": rec.timestamp.isoformat()}
 
-@app.get("/patients/{patient_id}/records")
-def get_records(patient_id: str):
-    db = SessionLocal()
-    db_patient = db.query(Patient).filter_by(patient_id=patient_id).first()
-    if not db_patient:
-        db.close()
-        raise HTTPException(status_code=404, detail="Patient not found")
-    records = db.query(Record).filter_by(patient_id=db_patient.id).order_by(Record.timestamp.asc()).all()
-    db.close()
-    return records
+@app.get("/patients/{patient_uid}/records")
+def list_records(patient_uid: str):
+    init_db_once()
+    if db_init_error:
+        raise HTTPException(500, f"DB not ready: {db_init_error}")
+    with SessionLocal() as s:
+        pat = s.query(Patient).filter_by(patient_uid=patient_uid).first()
+        if not pat:
+            raise HTTPException(404, "Patient not found")
+        rows = s.query(Record).filter_by(patient_id=pat.id).order_by(Record.timestamp.asc()).all()
+        return [{"id": r.id, "category": r.category, "timestamp": r.timestamp, "content": r.content} for r in rows]
