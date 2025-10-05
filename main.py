@@ -254,3 +254,102 @@ def ai_summary(patient_uid: str, x_api_key: str | None = Header(default=None)):
              .all()
         )
     return _heuristic_summary(pat, recs)
+
+from fastapi.responses import HTMLResponse
+
+@app.get("/", response_class=HTMLResponse)
+def root_page():
+    return """
+    <html>
+    <head>
+        <title>MedAI Dashboard</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+            body { font-family: Arial; margin: 20px; background: #f9f9f9; }
+            h1 { color: #1e4e9a; }
+            input, select, textarea { width: 100%; padding: 6px; margin: 4px 0; }
+            button { background: #1e4e9a; color: white; padding: 10px; border: none; border-radius: 5px; cursor: pointer; }
+            button:hover { background: #163b73; }
+            .card { background: white; padding: 15px; border-radius: 8px; margin-bottom: 15px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+            .output { white-space: pre-wrap; background: #f2f2f2; padding: 10px; border-radius: 5px; }
+        </style>
+    </head>
+    <body>
+        <h1>🩺 MedAI Dashboard</h1>
+        <div class="card">
+            <h3>1️⃣ Vytvor pacienta</h3>
+            <input id="apiKey" placeholder="API Key" value="m3dAI_7YtqgY2WJr9vQdXz">
+            <input id="patient_uid" placeholder="patient_uid (napr. P001)">
+            <input id="fname" placeholder="Meno">
+            <input id="lname" placeholder="Priezvisko">
+            <select id="gender">
+                <option value="M">Muž</option>
+                <option value="F">Žena</option>
+            </select>
+            <button onclick="createPatient()">Vytvoriť pacienta</button>
+        </div>
+
+        <div class="card">
+            <h3>2️⃣ Pridaj záznam</h3>
+            <input id="cat" placeholder="Kategória (napr. LAB, RTG, vizita...)">
+            <textarea id="content" placeholder='Obsah ako JSON, napr. {"test":"CRP","value":120,"unit":"mg/L"}'></textarea>
+            <button onclick="addRecord()">Pridať záznam</button>
+        </div>
+
+        <div class="card">
+            <h3>3️⃣ Generuj epikrízu</h3>
+            <button onclick="generateSummary()">Zobraziť / AI Summary</button>
+        </div>
+
+        <div id="output" class="output"></div>
+
+        <script>
+        async function createPatient() {
+            const apiKey = document.getElementById('apiKey').value;
+            const data = {
+                patient_uid: document.getElementById('patient_uid').value,
+                first_name: document.getElementById('fname').value,
+                last_name: document.getElementById('lname').value,
+                gender: document.getElementById('gender').value
+            };
+            const res = await fetch(`/patients`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-API-Key': apiKey },
+                body: JSON.stringify(data)
+            });
+            document.getElementById('output').textContent = await res.text();
+        }
+
+        async function addRecord() {
+            const apiKey = document.getElementById('apiKey').value;
+            const uid = document.getElementById('patient_uid').value;
+            const category = document.getElementById('cat').value;
+            let content;
+            try { content = JSON.parse(document.getElementById('content').value); } 
+            catch { alert('Neplatný JSON v obsahu'); return; }
+
+            const res = await fetch(`/patients/${uid}/records`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-API-Key': apiKey },
+                body: JSON.stringify({
+                    category: category,
+                    timestamp: new Date().toISOString(),
+                    content: content
+                })
+            });
+            document.getElementById('output').textContent = await res.text();
+        }
+
+        async function generateSummary() {
+            const apiKey = document.getElementById('apiKey').value;
+            const uid = document.getElementById('patient_uid').value;
+            const res = await fetch(`/ai/summary/${uid}`, {
+                headers: { 'X-API-Key': apiKey }
+            });
+            const data = await res.json();
+            document.getElementById('output').textContent = data.discharge_draft || JSON.stringify(data, null, 2);
+        }
+        </script>
+    </body>
+    </html>
+    """
