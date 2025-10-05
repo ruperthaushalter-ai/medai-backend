@@ -1,59 +1,35 @@
-import os
-from datetime import datetime
-from typing import Optional
-
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, Integer, String, JSON, DateTime, ForeignKey, text
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship
+from datetime import datetime
+import os
 
-app = FastAPI(title="MedAI Backend (safe)")
+# ---------- FastAPI inicializácia ----------
+app = FastAPI(title="MedAI Backend")
 
-DATABASE_URL = os.getenv("DATABASE_URL")  # musí byť nastavené v Railway Variables
+# ---------- Premenné prostredia ----------
+DATABASE_URL = os.getenv("DATABASE_URL")
+API_KEY = os.getenv("API_KEY")
+
+# ---------- Kontrola API kľúča ----------
+def check_key(key: str | None):
+    if API_KEY and key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+# ---------- Databázová inicializácia ----------
+Base = declarative_base()
 engine = None
 SessionLocal = None
-Base = declarative_base()
-db_init_error: Optional[str] = None
+db_init_error = None
 
-# ---------- DB MODELS ----------
-class Patient(Base):
-    __tablename__ = "patients"
-    id = Column(Integer, primary_key=True, index=True)
-    patient_uid = Column(String, unique=True, index=True)  # napr. "P001"
-    first_name = Column(String)
-    last_name = Column(String)
-    gender = Column(String)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    records = relationship("Record", back_populates="patient", cascade="all, delete")
-
-class Record(Base):
-    __tablename__ = "records"
-    id = Column(Integer, primary_key=True, index=True)
-    patient_id = Column(Integer, ForeignKey("patients.id"))
-    category = Column(String)              # "anamneza","vizita","lab","RTG","EKG","USG","liecba","uvahy"
-    timestamp = Column(DateTime)
-    content = Column(JSON)
-    patient = relationship("Patient", back_populates="records")
-
-class PatientIn(BaseModel):
-    patient_uid: str
-    first_name: Optional[str] = None
-    last_name: Optional[str] = None
-    gender: Optional[str] = None
-
-class RecordIn(BaseModel):
-    category: str
-    timestamp: datetime
-    content: dict
-
-# ---------- LAZY INIT DB (nespadne pri štarte) ----------
 def init_db_once():
     global engine, SessionLocal, db_init_error
     if engine is not None:
         return
     try:
         if not DATABASE_URL:
-            raise RuntimeError("DATABASE_URL is not set")
+            raise RuntimeError("DATABASE_URL not set")
         engine = create_engine(
             f"{DATABASE_URL}" + ("" if "sslmode=" in DATABASE_URL else "?sslmode=require"),
             pool_pre_ping=True,
@@ -65,21 +41,54 @@ def init_db_once():
     except Exception as e:
         db_init_error = str(e)
 
+# ---------- Modely ----------
+class Patient(Base):
+    __tablename__ = "patients"
+    id = Column(Integer, primary_key=True, index=True)
+    patient_uid = Column(String, unique=True, index=True)
+    first_name = Column(String)
+    last_name = Column(String)
+    gender = Column(String)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    records = relationship("Record", back_populates="patient", cascade="all, delete")
+
+class Record(Base):
+    __tablename__ = "records"
+    id = Column(Integer, primary_key=True, index=True)
+    patient_id = Column(Integer, ForeignKey("patients.id"))
+    category = Column(String)
+    timestamp = Column(DateTime)
+    content = Column(JSON)
+    patient = relationship("Patient", back_populates="records")
+
+# ---------- Pydantic modely ----------
+class PatientIn(BaseModel):
+    patient_uid: str
+    first_name: str | None = None
+    last_name: str | None = None
+    gender: str | None = None
+
+class RecordIn(BaseModel):
+    category: str
+    timestamp: datetime
+    content: dict
+
+# ---------- Endpointy ----------
 @app.get("/health")
 def health():
-    # pokus o jednoduchý SELECT; ukáž chybu namiesto crashu
     init_db_once()
     if db_init_error:
         return {"status": "db_error", "detail": db_init_error}
     try:
         with engine.connect() as c:
-            c.execute(text("select 1"))
+            c.execute(text("SELECT 1"))
         return {"status": "ok"}
     except Exception as e:
         return {"status": "db_error", "detail": str(e)}
 
 @app.post("/patients")
-def create_patient(p: PatientIn):
+def create_patient(p: PatientIn, x_api_key: str | None = Header(default=None)):
+    check_key(x_api_key)
     init_db_once()
     if db_init_error:
         raise HTTPException(500, f"DB not ready: {db_init_error}")
@@ -88,11 +97,14 @@ def create_patient(p: PatientIn):
         if existing:
             raise HTTPException(400, "Patient already exists")
         obj = Patient(**p.dict())
-        s.add(obj); s.commit(); s.refresh(obj)
+        s.add(obj)
+        s.commit()
+        s.refresh(obj)
         return {"id": obj.id, "patient_uid": obj.patient_uid}
 
 @app.post("/patients/{patient_uid}/records")
-def add_record(patient_uid: str, r: RecordIn):
+def add_record(patient_uid: str, r: RecordIn, x_api_key: str | None = Header(default=None)):
+    check_key(x_api_key)
     init_db_once()
     if db_init_error:
         raise HTTPException(500, f"DB not ready: {db_init_error}")
@@ -101,11 +113,14 @@ def add_record(patient_uid: str, r: RecordIn):
         if not pat:
             raise HTTPException(404, "Patient not found")
         rec = Record(patient_id=pat.id, category=r.category, timestamp=r.timestamp, content=r.content)
-        s.add(rec); s.commit(); s.refresh(rec)
+        s.add(rec)
+        s.commit()
+        s.refresh(rec)
         return {"id": rec.id, "category": rec.category, "timestamp": rec.timestamp.isoformat()}
 
 @app.get("/patients/{patient_uid}/records")
-def list_records(patient_uid: str):
+def list_records(patient_uid: str, x_api_key: str | None = Header(default=None)):
+    check_key(x_api_key)
     init_db_once()
     if db_init_error:
         raise HTTPException(500, f"DB not ready: {db_init_error}")
