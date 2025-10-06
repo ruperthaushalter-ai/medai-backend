@@ -1,14 +1,14 @@
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import HTMLResponse
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, JSON, ForeignKey, func
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, JSON, ForeignKey
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from datetime import datetime
 import os
 
 # --------------------------------------------------------------------
-#  SETTINGS
+# SETTINGS
 # --------------------------------------------------------------------
-app = FastAPI(title="MedAI Backend")
+app = FastAPI(title="MedAI Backend v2.2")
 
 API_KEY = os.getenv("API_KEY", "m3dAI_7YtqgY2WJr9vQdXz")
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/medai")
@@ -19,7 +19,7 @@ Base = declarative_base()
 
 
 # --------------------------------------------------------------------
-#  DATABASE MODELS
+# DATABASE MODELS
 # --------------------------------------------------------------------
 class Patient(Base):
     __tablename__ = "patients"
@@ -46,7 +46,7 @@ Base.metadata.create_all(bind=engine)
 
 
 # --------------------------------------------------------------------
-#  SECURITY CHECK
+# SECURITY
 # --------------------------------------------------------------------
 def check_key(x_api_key: str | None):
     if x_api_key != API_KEY:
@@ -54,7 +54,7 @@ def check_key(x_api_key: str | None):
 
 
 # --------------------------------------------------------------------
-#  ENDPOINTS
+# ENDPOINTS
 # --------------------------------------------------------------------
 @app.get("/health")
 def health():
@@ -126,7 +126,7 @@ def get_records(patient_uid: str, x_api_key: str | None = Header(default=None)):
 
 
 # --------------------------------------------------------------------
-#  HEURISTIC AI SUMMARY
+# HEURISTIC AI SUMMARY
 # --------------------------------------------------------------------
 @app.get("/ai/summary/{patient_uid}")
 def ai_summary(patient_uid: str, x_api_key: str | None = Header(default=None)):
@@ -138,24 +138,36 @@ def ai_summary(patient_uid: str, x_api_key: str | None = Header(default=None)):
         recs = s.query(Record).filter(Record.patient == p).order_by(Record.timestamp).all()
 
         summary_lines = []
-        diagnoses = []
-        therapies = []
+        diagnoses, therapies, labs, visits = [], [], [], []
 
         for r in recs:
             line = f"- {r.timestamp.strftime('%Y-%m-%d %H:%M')} {r.category}: {r.content}"
             summary_lines.append(line)
-            if "diag" in r.category.lower():
+            c = r.category.lower()
+            if "diag" in c:
                 diagnoses.append(str(r.content))
-            if "lie" in r.category.lower():
+            if "lie" in c:
                 therapies.append(str(r.content))
+            if "lab" in c:
+                labs.append(r)
+            if "viz" in c:
+                visits.append(r)
 
-        summary_text = "\n".join(summary_lines)
-        diag_text = "\n".join(diagnoses) if diagnoses else "bez diagnózy"
-        therapy_text = "\n".join(therapies) if therapies else "bez liečby"
+        # štatistiky
+        num_days = (recs[-1].timestamp - recs[0].timestamp).days + 1 if recs else 0
+        stats = {
+            "pocet_zaznamov": len(recs),
+            "pocet_vizit": len(visits),
+            "pocet_lab": len(labs),
+            "pocet_liecby": len(therapies),
+            "dlzka_hospitalizacie_dni": num_days,
+        }
 
         return {
-            "diagnoses": diag_text,
-            "timeline": summary_text,
+            "diagnoses": "\n".join(diagnoses) or "bez diagnózy",
+            "timeline": "\n".join(summary_lines),
+            "stats": stats,
+            "labs": [{"time": r.timestamp.isoformat(), "data": r.content} for r in labs],
             "discharge_draft": f"""
 PREPÚŠŤACIA SPRÁVA – NÁVRH
 
@@ -163,61 +175,73 @@ Pacient: {p.first_name} {p.last_name} ({p.patient_uid})
 Pohlavie: {p.gender}
 
 Diagnózy:
-{diag_text}
+{'; '.join(diagnoses) or 'bez diagnózy'}
 
 Chronologický priebeh:
-{summary_text}
+{chr(10).join(summary_lines)}
 
 Liečba:
-{therapy_text}
+{chr(10).join(therapies) or 'bez liečby'}
 
-Odporúčania:
-Pokračovať podľa klinického stavu, kontrola podľa potreby.
+Dĺžka hospitalizácie: {num_days} dní
             """,
         }
 
 
 # --------------------------------------------------------------------
-#  FRONTEND DASHBOARD (v2.0)
+# FRONTEND DASHBOARD 2.2
 # --------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 def ui_dashboard():
     return """
     <html>
     <head>
-        <title>MedAI Dashboard 2.0</title>
+        <title>MedAI Dashboard 2.2</title>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
         <style>
-            body { font-family: Arial, sans-serif; margin: 0; background: #f2f4f8; }
-            header { background: #1e4e9a; color: white; padding: 10px 15px; }
+            :root {
+                --bg: #f2f4f8;
+                --text: #111;
+                --card: #fff;
+                --accent: #1e4e9a;
+                --border: #ccc;
+            }
+            body.dark {
+                --bg: #121212;
+                --text: #e0e0e0;
+                --card: #1f1f1f;
+                --accent: #4a90e2;
+                --border: #333;
+            }
+            body { font-family: 'Inter', sans-serif; margin: 0; background: var(--bg); color: var(--text); transition: 0.3s; }
+            header { background: var(--accent); color: white; padding: 12px 18px; display: flex; justify-content: space-between; align-items: center; }
             h1 { margin: 0; font-size: 22px; }
             .container { display: flex; flex-wrap: wrap; padding: 10px; }
-            .sidebar { flex: 1; min-width: 250px; background: #fff; margin: 10px; padding: 10px; border-radius: 8px; height: 90vh; overflow-y: auto; }
-            .main { flex: 3; min-width: 300px; background: #fff; margin: 10px; padding: 15px; border-radius: 8px; }
-            button { background: #1e4e9a; color: white; border: none; padding: 8px 12px; border-radius: 4px; cursor: pointer; }
-            button:hover { background: #163b73; }
-            input, textarea, select { width: 100%; margin: 4px 0; padding: 6px; border: 1px solid #ccc; border-radius: 4px; }
-            .patient-item { padding: 8px; border-bottom: 1px solid #eee; cursor: pointer; }
-            .patient-item:hover { background: #f3f3f3; }
-            pre { white-space: pre-wrap; background: #f8f8f8; padding: 10px; border-radius: 6px; }
-            .tabs { display: flex; gap: 10px; margin-bottom: 10px; }
-            .tab { flex: 1; text-align: center; background: #e4e8ef; padding: 8px; border-radius: 6px; cursor: pointer; }
-            .tab.active { background: #1e4e9a; color: white; }
+            .sidebar { flex: 1; min-width: 260px; background: var(--card); margin: 10px; padding: 10px; border-radius: 8px; height: 88vh; overflow-y: auto; border: 1px solid var(--border); }
+            .main { flex: 3; min-width: 300px; background: var(--card); margin: 10px; padding: 15px; border-radius: 8px; border: 1px solid var(--border); }
+            button { background: var(--accent); color: white; border: none; padding: 8px 12px; border-radius: 6px; cursor: pointer; margin-top: 5px; }
+            input, textarea, select { width: 100%; margin: 4px 0; padding: 6px; border: 1px solid var(--border); border-radius: 4px; background: var(--card); color: var(--text); }
+            .patient-item { padding: 8px; border-bottom: 1px solid var(--border); cursor: pointer; }
+            .tab { display:inline-block; padding:6px 10px; border-radius:5px; margin-right:5px; cursor:pointer; background:#e4e8ef; }
+            .tab.active { background: var(--accent); color: white; }
+            .tabContent { display:none; }
+            pre { white-space: pre-wrap; background: #0001; padding: 10px; border-radius: 6px; color: var(--text); }
+            canvas { max-width:100%; background:#fff1; border-radius:8px; margin-top:10px; }
         </style>
     </head>
     <body>
-        <header><h1>🩺 MedAI Dashboard 2.0</h1></header>
+        <header><h1>🩺 MedAI Dashboard 2.2</h1><button onclick="toggleDark()">🌙 Režim</button></header>
 
         <div class="container">
             <div class="sidebar">
                 <h3>Pacienti</h3>
-                <input id="apiKey" placeholder="API Key" style="width:100%; margin-bottom:5px;" value="">
+                <input id="apiKey" placeholder="API Key">
                 <button onclick="loadPatients()">Načítať pacientov</button>
                 <div id="patientList"></div>
-
-                <hr>
-                <h4>Nový pacient</h4>
-                <input id="uid" placeholder="UID (napr. P003)">
+                <hr><h4>Nový pacient</h4>
+                <input id="uid" placeholder="UID">
                 <input id="fname" placeholder="Meno">
                 <input id="lname" placeholder="Priezvisko">
                 <select id="gender"><option value="M">M</option><option value="F">F</option></select>
@@ -225,96 +249,72 @@ def ui_dashboard():
             </div>
 
             <div class="main">
-                <div class="tabs">
-                    <div class="tab active" onclick="showTab('timeline')">📆 Priebeh</div>
-                    <div class="tab" onclick="showTab('summary')">🧠 AI Summary</div>
-                    <div class="tab" onclick="showTab('therapy')">💊 Liečba</div>
+                <div>
+                    <span class="tab active" onclick="showTab('timeline')">📆 Priebeh</span>
+                    <span class="tab" onclick="showTab('summary')">🧠 AI Summary</span>
+                    <span class="tab" onclick="showTab('therapy')">💊 Liečba</span>
+                    <span class="tab" onclick="showTab('stats')">📊 Štatistiky</span>
+                    <button onclick="exportPDF()">📄 Export PDF</button>
                 </div>
-
-                <div id="timeline" class="tabContent"></div>
-                <div id="summary" class="tabContent" style="display:none;"></div>
-                <div id="therapy" class="tabContent" style="display:none;"></div>
-
-                <hr>
-                <h4>Pridaj záznam</h4>
-                <input id="cat" placeholder="Kategória (napr. LAB, RTG, vizita...)">
-                <textarea id="content" placeholder='Obsah JSON, napr. {"test":"CRP","value":120,"unit":"mg/L"}'></textarea>
-                <button onclick="addRecord()">Pridať záznam</button>
+                <div id="timeline" class="tabContent" style="display:block;"></div>
+                <div id="summary" class="tabContent"></div>
+                <div id="therapy" class="tabContent"></div>
+                <div id="stats" class="tabContent">
+                    <h3>Štatistiky hospitalizácie</h3>
+                    <div id="statsBox"></div>
+                    <canvas id="labChart"></canvas>
+                </div>
+                <hr><h4>Pridaj záznam</h4>
+                <input id="cat" placeholder="Kategória">
+                <textarea id="content" placeholder='Obsah JSON (napr. {"test":"CRP","value":120,"unit":"mg/L"})'></textarea>
+                <button onclick="addRecord()">Pridať</button>
             </div>
         </div>
 
         <script>
-        let selectedPatient = null;
-
-        function showTab(id){
-            document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+        let selectedPatient=null;let latestSummary='';let chart=null;
+        function toggleDark(){document.body.classList.toggle('dark');}
+        function showTab(id){document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
             document.querySelectorAll('.tabContent').forEach(c=>c.style.display='none');
             document.querySelector(`.tab[onclick="showTab('${id}')"]`).classList.add('active');
-            document.getElementById(id).style.display='block';
-        }
-
+            document.getElementById(id).style.display='block';}
         async function loadPatients(){
-            const apiKey = document.getElementById('apiKey').value;
-            const res = await fetch('/patients', { headers: { 'X-API-Key': apiKey }});
-            const data = await res.json();
-            const list = document.getElementById('patientList');
-            list.innerHTML = '';
-            data.forEach(p=>{
-                const div = document.createElement('div');
-                div.className='patient-item';
-                div.textContent = `${p.patient_uid} - ${p.first_name||''} ${p.last_name||''}`;
-                div.onclick = ()=>loadPatient(p.patient_uid);
-                list.appendChild(div);
-            });
-        }
-
+            const apiKey=document.getElementById('apiKey').value;
+            const res=await fetch('/patients',{headers:{'X-API-Key':apiKey}});
+            const data=await res.json();const list=document.getElementById('patientList');list.innerHTML='';
+            data.forEach(p=>{const div=document.createElement('div');div.className='patient-item';
+                div.textContent=`${p.patient_uid} - ${p.first_name||''} ${p.last_name||''}`;
+                div.onclick=()=>loadPatient(p.patient_uid);list.appendChild(div);});}
         async function createPatient(){
-            const apiKey = document.getElementById('apiKey').value;
-            const body = {
-                patient_uid: document.getElementById('uid').value,
-                first_name: document.getElementById('fname').value,
-                last_name: document.getElementById('lname').value,
-                gender: document.getElementById('gender').value
-            };
-            await fetch('/patients', { method:'POST', headers:{'Content-Type':'application/json','X-API-Key':apiKey}, body:JSON.stringify(body)});
-            loadPatients();
-        }
-
+            const apiKey=document.getElementById('apiKey').value;
+            const body={patient_uid:uid.value,first_name:fname.value,last_name:lname.value,gender:gender.value};
+            await fetch('/patients',{method:'POST',headers:{'Content-Type':'application/json','X-API-Key':apiKey},body:JSON.stringify(body)});loadPatients();}
         async function loadPatient(uid){
-            selectedPatient = uid;
-            const apiKey = document.getElementById('apiKey').value;
-            const res = await fetch(`/patients/${uid}/records`, { headers:{'X-API-Key':apiKey} });
-            const data = await res.json();
-            let html = '';
-            let therapyList = [];
-            data.forEach(r=>{
-                const time = new Date(r.timestamp).toLocaleString();
-                html += `<b>${r.category}</b> (${time})<br>${JSON.stringify(r.content)}<hr>`;
-                if(r.category.toLowerCase().includes('lieč')){
-                    therapyList.push(JSON.stringify(r.content));
-                }
-            });
-            document.getElementById('timeline').innerHTML = html || 'Žiadne záznamy';
-            document.getElementById('therapy').innerHTML = therapyList.join('<br>') || 'Žiadna liečba';
-            const ai = await fetch(`/ai/summary/${uid}`, { headers:{'X-API-Key':apiKey}});
-            const sum = await ai.json();
-            document.getElementById('summary').innerHTML = `<pre>${sum.discharge_draft}</pre>`;
-        }
-
+            selectedPatient=uid;const apiKey=document.getElementById('apiKey').value;
+            const res=await fetch(`/ai/summary/${uid}`,{headers:{'X-API-Key':apiKey}});const data=await res.json();
+            latestSummary=data.discharge_draft;
+            document.getElementById('summary').innerHTML=`<pre>${latestSummary}</pre>`;
+            document.getElementById('timeline').innerHTML=`<pre>${data.timeline}</pre>`;
+            document.getElementById('therapy').innerHTML=`<pre>${data.diagnoses}</pre>`;
+            document.getElementById('statsBox').innerHTML=`<pre>${JSON.stringify(data.stats,null,2)}</pre>`;
+            if(data.labs.length>0){
+                const values=data.labs.map(l=>l.data.value||0);
+                const labels=data.labs.map(l=>new Date(l.time).toLocaleDateString());
+                if(chart)chart.destroy();
+                chart=new Chart(document.getElementById('labChart'),{type:'line',data:{labels:labels,datasets:[{label:'CRP / hodnoty LAB',data:values,borderColor:'#1e4e9a',fill:false}]},options:{scales:{y:{beginAtZero:true}}}});
+            }}
         async function addRecord(){
-            if(!selectedPatient){alert('Vyber pacienta.');return;}
-            const apiKey = document.getElementById('apiKey').value;
-            const cat = document.getElementById('cat').value;
-            let content;
-            try{ content = JSON.parse(document.getElementById('content').value); }catch{ alert('Neplatný JSON'); return; }
-            await fetch(`/patients/${selectedPatient}/records`, {
-                method:'POST',
-                headers:{'Content-Type':'application/json','X-API-Key':apiKey},
-                body:JSON.stringify({ category:cat, timestamp:new Date().toISOString(), content:content })
-            });
-            loadPatient(selectedPatient);
-        }
+            if(!selectedPatient){alert('Vyber pacienta');return;}
+            const apiKey=document.getElementById('apiKey').value;const cat=document.getElementById('cat').value;
+            let content;try{content=JSON.parse(document.getElementById('content').value);}catch{alert('Neplatný JSON');return;}
+            await fetch(`/patients/${selectedPatient}/records`,{method:'POST',headers:{'Content-Type':'application/json','X-API-Key':apiKey},
+                body:JSON.stringify({category:cat,timestamp:new Date().toISOString(),content:content})});
+            loadPatient(selectedPatient);}
+        function exportPDF(){
+            if(!latestSummary){alert('Najprv načítaj AI summary');return;}
+            const element=document.createElement('div');
+            element.innerHTML=`<h2>Prepúšťacia správa</h2><pre>${latestSummary}</pre>`;
+            html2pdf().from(element).save(`discharge_${selectedPatient}.pdf`);}
         </script>
-    </body>
-    </html>
+    </body></html>
     """
