@@ -1,58 +1,217 @@
+from fastapi import FastAPI, HTTPException, Header
+from fastapi.responses import HTMLResponse
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, JSON, ForeignKey, func
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship
+from datetime import datetime
+import os
+
+# --------------------------------------------------------------------
+#  SETTINGS
+# --------------------------------------------------------------------
+app = FastAPI(title="MedAI Backend")
+
+API_KEY = os.getenv("API_KEY", "m3dAI_7YtqgY2WJr9vQdXz")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/medai")
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(bind=engine)
+Base = declarative_base()
+
+
+# --------------------------------------------------------------------
+#  DATABASE MODELS
+# --------------------------------------------------------------------
+class Patient(Base):
+    __tablename__ = "patients"
+    id = Column(Integer, primary_key=True)
+    patient_uid = Column(String, unique=True)
+    first_name = Column(String)
+    last_name = Column(String)
+    gender = Column(String)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    records = relationship("Record", back_populates="patient")
+
+
+class Record(Base):
+    __tablename__ = "records"
+    id = Column(Integer, primary_key=True)
+    patient_id = Column(Integer, ForeignKey("patients.id"))
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    category = Column(String)
+    content = Column(JSON)
+    patient = relationship("Patient", back_populates="records")
+
+
+Base.metadata.create_all(bind=engine)
+
+
+# --------------------------------------------------------------------
+#  SECURITY CHECK
+# --------------------------------------------------------------------
+def check_key(x_api_key: str | None):
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid API key")
+
+
+# --------------------------------------------------------------------
+#  ENDPOINTS
+# --------------------------------------------------------------------
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/patients")
+def create_patient(patient: dict, x_api_key: str | None = Header(default=None)):
+    check_key(x_api_key)
+    with SessionLocal() as s:
+        p = Patient(
+            patient_uid=patient["patient_uid"],
+            first_name=patient.get("first_name"),
+            last_name=patient.get("last_name"),
+            gender=patient.get("gender", "M"),
+        )
+        s.add(p)
+        s.commit()
+        return {"id": p.id, "patient_uid": p.patient_uid}
+
+
+@app.get("/patients")
+def list_patients(x_api_key: str | None = Header(default=None)):
+    check_key(x_api_key)
+    with SessionLocal() as s:
+        rows = s.query(Patient).order_by(Patient.created_at.desc()).all()
+        return [
+            {
+                "patient_uid": r.patient_uid,
+                "first_name": r.first_name,
+                "last_name": r.last_name,
+                "gender": r.gender,
+                "created_at": r.created_at,
+            }
+            for r in rows
+        ]
+
+
+@app.post("/patients/{patient_uid}/records")
+def add_record(patient_uid: str, record: dict, x_api_key: str | None = Header(default=None)):
+    check_key(x_api_key)
+    with SessionLocal() as s:
+        p = s.query(Patient).filter(Patient.patient_uid == patient_uid).first()
+        if not p:
+            raise HTTPException(404, "Patient not found")
+        r = Record(
+            patient=p,
+            category=record["category"],
+            timestamp=datetime.fromisoformat(record["timestamp"].replace("Z", "+00:00")),
+            content=record["content"],
+        )
+        s.add(r)
+        s.commit()
+        return {"status": "record added"}
+
+
+@app.get("/patients/{patient_uid}/records")
+def get_records(patient_uid: str, x_api_key: str | None = Header(default=None)):
+    check_key(x_api_key)
+    with SessionLocal() as s:
+        p = s.query(Patient).filter(Patient.patient_uid == patient_uid).first()
+        if not p:
+            raise HTTPException(404, "Patient not found")
+        recs = s.query(Record).filter(Record.patient == p).order_by(Record.timestamp).all()
+        return [
+            {"category": r.category, "timestamp": r.timestamp, "content": r.content}
+            for r in recs
+        ]
+
+
+# --------------------------------------------------------------------
+#  HEURISTIC AI SUMMARY
+# --------------------------------------------------------------------
+@app.get("/ai/summary/{patient_uid}")
+def ai_summary(patient_uid: str, x_api_key: str | None = Header(default=None)):
+    check_key(x_api_key)
+    with SessionLocal() as s:
+        p = s.query(Patient).filter(Patient.patient_uid == patient_uid).first()
+        if not p:
+            raise HTTPException(404, "Patient not found")
+        recs = s.query(Record).filter(Record.patient == p).order_by(Record.timestamp).all()
+
+        summary_lines = []
+        diagnoses = []
+        therapies = []
+
+        for r in recs:
+            line = f"- {r.timestamp.strftime('%Y-%m-%d %H:%M')} {r.category}: {r.content}"
+            summary_lines.append(line)
+            if "diag" in r.category.lower():
+                diagnoses.append(str(r.content))
+            if "lie" in r.category.lower():
+                therapies.append(str(r.content))
+
+        summary_text = "\n".join(summary_lines)
+        diag_text = "\n".join(diagnoses) if diagnoses else "bez diagnózy"
+        therapy_text = "\n".join(therapies) if therapies else "bez liečby"
+
+        return {
+            "diagnoses": diag_text,
+            "timeline": summary_text,
+            "discharge_draft": f"""
+PREPÚŠŤACIA SPRÁVA – NÁVRH
+
+Pacient: {p.first_name} {p.last_name} ({p.patient_uid})
+Pohlavie: {p.gender}
+
+Diagnózy:
+{diag_text}
+
+Chronologický priebeh:
+{summary_text}
+
+Liečba:
+{therapy_text}
+
+Odporúčania:
+Pokračovať podľa klinického stavu, kontrola podľa potreby.
+            """,
+        }
+
+
+# --------------------------------------------------------------------
+#  FRONTEND DASHBOARD (v2.0)
+# --------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 def ui_dashboard():
     return """
     <html>
     <head>
-        <title>MedAI Dashboard 2.1</title>
+        <title>MedAI Dashboard 2.0</title>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <style>
-            :root {
-                --bg: #f2f4f8;
-                --text: #111;
-                --card: #fff;
-                --accent: #1e4e9a;
-                --border: #ccc;
-            }
-            body.dark {
-                --bg: #121212;
-                --text: #e0e0e0;
-                --card: #1f1f1f;
-                --accent: #4a90e2;
-                --border: #333;
-            }
-            body { font-family: 'Inter', sans-serif; margin: 0; background: var(--bg); color: var(--text); transition: all 0.3s ease; }
-            header { background: var(--accent); color: white; padding: 12px 18px; display: flex; justify-content: space-between; align-items: center; }
+            body { font-family: Arial, sans-serif; margin: 0; background: #f2f4f8; }
+            header { background: #1e4e9a; color: white; padding: 10px 15px; }
             h1 { margin: 0; font-size: 22px; }
             .container { display: flex; flex-wrap: wrap; padding: 10px; }
-            .sidebar { flex: 1; min-width: 260px; background: var(--card); margin: 10px; padding: 10px; border-radius: 8px; height: 88vh; overflow-y: auto; border: 1px solid var(--border); }
-            .main { flex: 3; min-width: 300px; background: var(--card); margin: 10px; padding: 15px; border-radius: 8px; border: 1px solid var(--border); }
-            button { background: var(--accent); color: white; border: none; padding: 8px 12px; border-radius: 6px; cursor: pointer; margin-top: 5px; }
-            button:hover { opacity: 0.9; }
-            input, textarea, select { width: 100%; margin: 4px 0; padding: 6px; border: 1px solid var(--border); border-radius: 4px; background: var(--card); color: var(--text); }
-            .patient-item { padding: 8px; border-bottom: 1px solid var(--border); cursor: pointer; }
-            .patient-item:hover { background: rgba(0,0,0,0.05); }
-            pre { white-space: pre-wrap; background: #0001; padding: 10px; border-radius: 6px; color: var(--text); }
+            .sidebar { flex: 1; min-width: 250px; background: #fff; margin: 10px; padding: 10px; border-radius: 8px; height: 90vh; overflow-y: auto; }
+            .main { flex: 3; min-width: 300px; background: #fff; margin: 10px; padding: 15px; border-radius: 8px; }
+            button { background: #1e4e9a; color: white; border: none; padding: 8px 12px; border-radius: 4px; cursor: pointer; }
+            button:hover { background: #163b73; }
+            input, textarea, select { width: 100%; margin: 4px 0; padding: 6px; border: 1px solid #ccc; border-radius: 4px; }
+            .patient-item { padding: 8px; border-bottom: 1px solid #eee; cursor: pointer; }
+            .patient-item:hover { background: #f3f3f3; }
+            pre { white-space: pre-wrap; background: #f8f8f8; padding: 10px; border-radius: 6px; }
             .tabs { display: flex; gap: 10px; margin-bottom: 10px; }
-            .tab { flex: 1; text-align: center; background: #e4e8ef; padding: 8px; border-radius: 6px; cursor: pointer; transition: 0.3s; }
-            body.dark .tab { background: #333; }
-            .tab.active { background: var(--accent); color: white; }
-            #pdfBtn { float: right; margin-top: -5px; }
-            ::-webkit-scrollbar { width: 6px; } 
-            ::-webkit-scrollbar-thumb { background: #888; border-radius: 3px; }
+            .tab { flex: 1; text-align: center; background: #e4e8ef; padding: 8px; border-radius: 6px; cursor: pointer; }
+            .tab.active { background: #1e4e9a; color: white; }
         </style>
     </head>
     <body>
-        <header>
-            <h1>🩺 MedAI Dashboard 2.1</h1>
-            <div>
-                <button onclick="toggleDark()">🌙 Režim</button>
-            </div>
-        </header>
+        <header><h1>🩺 MedAI Dashboard 2.0</h1></header>
 
         <div class="container">
             <div class="sidebar">
                 <h3>Pacienti</h3>
-                <input id="apiKey" placeholder="API Key" style="width:100%; margin-bottom:5px;">
+                <input id="apiKey" placeholder="API Key" style="width:100%; margin-bottom:5px;" value="">
                 <button onclick="loadPatients()">Načítať pacientov</button>
                 <div id="patientList"></div>
 
@@ -72,8 +231,6 @@ def ui_dashboard():
                     <div class="tab" onclick="showTab('therapy')">💊 Liečba</div>
                 </div>
 
-                <button id="pdfBtn" onclick="exportPDF()">📄 Exportovať PDF</button>
-
                 <div id="timeline" class="tabContent"></div>
                 <div id="summary" class="tabContent" style="display:none;"></div>
                 <div id="therapy" class="tabContent" style="display:none;"></div>
@@ -86,14 +243,8 @@ def ui_dashboard():
             </div>
         </div>
 
-        <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
         <script>
         let selectedPatient = null;
-        let latestSummary = '';
-
-        function toggleDark(){
-            document.body.classList.toggle('dark');
-        }
 
         function showTab(id){
             document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
@@ -147,8 +298,7 @@ def ui_dashboard():
             document.getElementById('therapy').innerHTML = therapyList.join('<br>') || 'Žiadna liečba';
             const ai = await fetch(`/ai/summary/${uid}`, { headers:{'X-API-Key':apiKey}});
             const sum = await ai.json();
-            latestSummary = sum.discharge_draft;
-            document.getElementById('summary').innerHTML = `<pre>${latestSummary}</pre>`;
+            document.getElementById('summary').innerHTML = `<pre>${sum.discharge_draft}</pre>`;
         }
 
         async function addRecord(){
@@ -163,13 +313,6 @@ def ui_dashboard():
                 body:JSON.stringify({ category:cat, timestamp:new Date().toISOString(), content:content })
             });
             loadPatient(selectedPatient);
-        }
-
-        function exportPDF(){
-            if(!latestSummary){alert('Najprv načítaj AI summary');return;}
-            const element = document.createElement('div');
-            element.innerHTML = `<h2>Prepúšťacia správa</h2><pre>${latestSummary}</pre>`;
-            html2pdf().from(element).save(`discharge_${selectedPatient}.pdf`);
         }
         </script>
     </body>
