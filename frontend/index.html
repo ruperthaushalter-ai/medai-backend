@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="sk">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>MedAI Dashboard 2.2+</title>
+  <link rel="stylesheet" href="/static/styles.css"/>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+</head>
+<body>
+<header>
+  <div class="brand">🩺 MedAI Dashboard 2.2+</div>
+  <div class="row">
+    <input id="apiKey" placeholder="API Key" />
+    <span id="online" class="badge">offline</span>
+    <button onclick="toggleTheme()">🌓</button>
+  </div>
+</header>
+
+<div class="wrap">
+  <!-- SIDEBAR -->
+  <div class="card sidebar">
+    <div class="row">
+      <input id="search" placeholder="Hľadať pacienta..." oninput="filterPatients()">
+      <button onclick="loadPatients()">Načítať pacientov</button>
+    </div>
+    <div class="helper">Filtrovanie: všetci | posledné vytvorené</div>
+    <div id="patientList" class="list" style="margin-top:8px"></div>
+    <hr>
+    <h4>Nový pacient</h4>
+    <div class="row">
+      <input id="uid" placeholder="UID (napr. P001)">
+      <select id="gender"><option value="M">M</option><option value="F">F</option></select>
+      <input id="fname" placeholder="Meno">
+      <input id="lname" placeholder="Priezvisko">
+      <button onclick="createPatient()">Vytvoriť</button>
+    </div>
+  </div>
+
+  <!-- MAIN -->
+  <div class="card main">
+    <div id="patientHeader" class="helper">Vyber pacienta zo zoznamu vľavo.</div>
+
+    <div class="tabbar">
+      <div class="tab active" data-tab="timeline" onclick="showTab('timeline')">📆 Priebeh</div>
+      <div class="tab" data-tab="summary" onclick="showTab('summary')">🧠 AI Summary</div>
+      <div class="tab" data-tab="therapy" onclick="showTab('therapy')">💊 Liečba</div>
+      <div class="tab" data-tab="stats" onclick="showTab('stats')">📊 Štatistiky</div>
+      <button onclick="exportPDF()">📄 Export PDF</button>
+    </div>
+
+    <div class="subtabs" id="filterBar" style="display:none">
+      <div class="sub active" data-kind="ALL" onclick="setKind('ALL')">Všetko</div>
+      <div class="sub" data-kind="LAB" onclick="setKind('LAB')">LAB</div>
+      <div class="sub" data-kind="EKG" onclick="setKind('EKG')">EKG</div>
+      <div class="sub" data-kind="RTG" onclick="setKind('RTG')">RTG</div>
+      <div class="sub" data-kind="VIZITA" onclick="setKind('VIZITA')">Vizity</div>
+      <div class="sub" data-kind="DIAG" onclick="setKind('DIAG')">Diagnózy</div>
+      <div class="sub" data-kind="OTHER" onclick="setKind('OTHER')">Ostatné</div>
+    </div>
+
+    <div id="timeline" class="tabPane" style="display:block"></div>
+    <div id="summary" class="tabPane"></div>
+    <div id="therapy" class="tabPane"></div>
+    <div id="stats" class="tabPane">
+      <h3>Štatistiky hospitalizácie</h3>
+      <div id="statsBox"><pre>{}</pre></div>
+      <canvas id="labChart"></canvas>
+    </div>
+
+    <hr>
+    <h4>Rýchle šablóny</h4>
+    <div class="row">
+      <button onclick='quick("LAB")'>LAB</button>
+      <button onclick='quick("EKG")'>EKG</button>
+      <button onclick='quick("RTG")'>RTG</button>
+      <button onclick='quick("VIZITA")'>Vizita</button>
+      <button onclick='quick("DIAG")'>Diagnóza</button>
+      <button onclick='quick("LIEČBA")'>Liečba</button>
+    </div>
+
+    <h4 style="margin-top:10px">Pridaj záznam</h4>
+    <div class="row"><label><input type="checkbox" id="autoCat" checked> Auto kategória</label></div>
+    <div class="row">
+      <input id="cat" placeholder="Kategória (ak je Auto vypnuté)">
+      <textarea id="content" rows="5" placeholder='Obsah JSON (napr. {"test":"CRP","value":120,"unit":"mg/L"})'></textarea>
+      <button onclick="addRecord()">Pridať</button>
+    </div>
+    <div class="helper">TIP: „CRP 120 mg/L“ → pri zapnutej voľbe „Auto kategória“ sa zvolí LAB.</div>
+  </div>
+</div>
+
+<!-- Drawer detail -->
+<div id="drawer" class="drawer">
+  <div class="row" style="justify-content:space-between">
+    <h3>Detail záznamu</h3>
+    <button onclick="closeDrawer()">✖</button>
+  </div>
+  <div id="drawerBody"><pre>{}</pre></div>
+  <div class="row"><button onclick="copyDrawer()">Kopírovať JSON</button></div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
