@@ -1,186 +1,177 @@
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from datetime import datetime
-import os
-
-app = FastAPI(title="MedAI Dashboard 2.2")
-
-# ====== Konfigurácia ======
-API_KEY = os.getenv("API_KEY", "m3dAI_7YtqgY2WJr9vQdXz")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ====== Dátové modely ======
-class Patient(BaseModel):
-    patient_uid: str
-    first_name: str | None = None
-    last_name: str | None = None
-    gender: str | None = None
-
-class Record(BaseModel):
-    category: str
-    timestamp: str
-    content: dict
-
-patients = {}
-records = {}
-
-# ====== API endpointy ======
-@app.get("/health")
-def health(): return {"status": "OK"}
-
-@app.get("/patients")
-def get_patients(request: Request):
-    if request.headers.get("X-API-Key") != API_KEY:
-        raise HTTPException(403, "Invalid API Key")
-    return list(patients.values())
-
-@app.post("/patients")
-def create_patient(request: Request, p: Patient):
-    if request.headers.get("X-API-Key") != API_KEY:
-        raise HTTPException(403, "Invalid API Key")
-    patients[p.patient_uid] = p.dict()
-    records[p.patient_uid] = []
-    return {"status": "created", "uid": p.patient_uid}
-
-@app.get("/patients/{uid}/records")
-def get_records(uid: str, request: Request):
-    if request.headers.get("X-API-Key") != API_KEY:
-        raise HTTPException(403, "Invalid API Key")
-    return records.get(uid, [])
-
-@app.post("/patients/{uid}/records")
-def add_record(uid: str, request: Request, r: Record):
-    if request.headers.get("X-API-Key") != API_KEY:
-        raise HTTPException(403, "Invalid API Key")
-    if uid not in records: raise HTTPException(404, "Patient not found")
-    records[uid].append(r.dict())
-    return {"status": "added"}
-
-# ====== AI Heuristika (mock analýza) ======
-@app.get("/ai/summary/{uid}")
-def ai_summary(uid: str, request: Request):
-    if request.headers.get("X-API-Key") != API_KEY:
-        raise HTTPException(403, "Invalid API Key")
-    recs = records.get(uid, [])
-    if not recs: return {"summary": "No data"}
-
-    labs = [r for r in recs if r["category"].lower() == "lab"]
-    days = len(set(r["timestamp"][:10] for r in recs))
-    diag = []
-    if any("crp" in str(r["content"]).lower() for r in labs): diag.append("Infekcia?")
-    if any("alt" in str(r["content"]).lower() for r in labs): diag.append("Možné poškodenie pečene")
-    draft = f"Pacient mal {len(recs)} záznamov počas {days} dní.\n" \
-            f"Detegované kategórie: {', '.join(set(r['category'] for r in recs))}\n" \
-            f"AI vyhodnotila možné diagnózy: {', '.join(diag) if diag else 'žiadne abnormity'}."
-    return {"discharge_draft": draft}
-
-# ====== FRONTEND DASHBOARD ======
 @app.get("/", response_class=HTMLResponse)
-def ui():
+def ui_dashboard():
     return """
     <html>
     <head>
-        <title>MedAI Dashboard 2.2</title>
-        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        <title>MedAI Dashboard 2.1</title>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <style>
-            body { font-family: 'Inter', sans-serif; background:#f3f4f6; color:#111; margin:0; }
-            header { background:#1e4e9a; color:white; padding:10px 20px; display:flex; justify-content:space-between; align-items:center; }
-            button { background:#1e4e9a; color:white; border:none; padding:6px 12px; border-radius:5px; cursor:pointer; }
-            .container { display:flex; flex-wrap:wrap; padding:10px; }
-            .panel { background:white; border-radius:8px; margin:8px; padding:10px; flex:1; min-width:300px; box-shadow:0 2px 6px rgba(0,0,0,0.1);}
-            input, textarea { width:100%; margin:4px 0; padding:6px; border:1px solid #ccc; border-radius:4px; }
-            #chartDiv { height:300px; }
+            :root {
+                --bg: #f2f4f8;
+                --text: #111;
+                --card: #fff;
+                --accent: #1e4e9a;
+                --border: #ccc;
+            }
+            body.dark {
+                --bg: #121212;
+                --text: #e0e0e0;
+                --card: #1f1f1f;
+                --accent: #4a90e2;
+                --border: #333;
+            }
+            body { font-family: 'Inter', sans-serif; margin: 0; background: var(--bg); color: var(--text); transition: all 0.3s ease; }
+            header { background: var(--accent); color: white; padding: 12px 18px; display: flex; justify-content: space-between; align-items: center; }
+            h1 { margin: 0; font-size: 22px; }
+            .container { display: flex; flex-wrap: wrap; padding: 10px; }
+            .sidebar { flex: 1; min-width: 260px; background: var(--card); margin: 10px; padding: 10px; border-radius: 8px; height: 88vh; overflow-y: auto; border: 1px solid var(--border); }
+            .main { flex: 3; min-width: 300px; background: var(--card); margin: 10px; padding: 15px; border-radius: 8px; border: 1px solid var(--border); }
+            button { background: var(--accent); color: white; border: none; padding: 8px 12px; border-radius: 6px; cursor: pointer; margin-top: 5px; }
+            button:hover { opacity: 0.9; }
+            input, textarea, select { width: 100%; margin: 4px 0; padding: 6px; border: 1px solid var(--border); border-radius: 4px; background: var(--card); color: var(--text); }
+            .patient-item { padding: 8px; border-bottom: 1px solid var(--border); cursor: pointer; }
+            .patient-item:hover { background: rgba(0,0,0,0.05); }
+            pre { white-space: pre-wrap; background: #0001; padding: 10px; border-radius: 6px; color: var(--text); }
+            .tabs { display: flex; gap: 10px; margin-bottom: 10px; }
+            .tab { flex: 1; text-align: center; background: #e4e8ef; padding: 8px; border-radius: 6px; cursor: pointer; transition: 0.3s; }
+            body.dark .tab { background: #333; }
+            .tab.active { background: var(--accent); color: white; }
+            #pdfBtn { float: right; margin-top: -5px; }
+            ::-webkit-scrollbar { width: 6px; } 
+            ::-webkit-scrollbar-thumb { background: #888; border-radius: 3px; }
         </style>
     </head>
     <body>
         <header>
-            <h2>🧠 MedAI Dashboard 2.2</h2>
-            <input id="apiKey" placeholder="API Key" style="width:250px;">
+            <h1>🩺 MedAI Dashboard 2.1</h1>
+            <div>
+                <button onclick="toggleDark()">🌙 Režim</button>
+            </div>
         </header>
+
         <div class="container">
-            <div class="panel">
+            <div class="sidebar">
                 <h3>Pacienti</h3>
-                <button onclick="loadPatients()">🔄 Načítať</button>
+                <input id="apiKey" placeholder="API Key" style="width:100%; margin-bottom:5px;">
+                <button onclick="loadPatients()">Načítať pacientov</button>
                 <div id="patientList"></div>
+
                 <hr>
                 <h4>Nový pacient</h4>
-                <input id="uid" placeholder="UID (P001)">
+                <input id="uid" placeholder="UID (napr. P003)">
                 <input id="fname" placeholder="Meno">
                 <input id="lname" placeholder="Priezvisko">
-                <button onclick="createPatient()">➕ Vytvoriť</button>
+                <select id="gender"><option value="M">M</option><option value="F">F</option></select>
+                <button onclick="createPatient()">Vytvoriť</button>
             </div>
-            <div class="panel">
-                <h3>📋 Záznamy</h3>
-                <input id="cat" placeholder="Kategória">
-                <textarea id="content" placeholder='Obsah JSON {"test":"CRP","value":120,"unit":"mg/L"}'></textarea>
-                <button onclick="addRecord()">💾 Uložiť</button>
+
+            <div class="main">
+                <div class="tabs">
+                    <div class="tab active" onclick="showTab('timeline')">📆 Priebeh</div>
+                    <div class="tab" onclick="showTab('summary')">🧠 AI Summary</div>
+                    <div class="tab" onclick="showTab('therapy')">💊 Liečba</div>
+                </div>
+
+                <button id="pdfBtn" onclick="exportPDF()">📄 Exportovať PDF</button>
+
+                <div id="timeline" class="tabContent"></div>
+                <div id="summary" class="tabContent" style="display:none;"></div>
+                <div id="therapy" class="tabContent" style="display:none;"></div>
+
                 <hr>
-                <h4>História</h4>
-                <div id="records"></div>
-            </div>
-            <div class="panel">
-                <h3>📊 AI Analýza a Grafy</h3>
-                <button onclick="generateAI()">🧠 Analyzovať</button>
-                <pre id="ai"></pre>
-                <canvas id="chartDiv"></canvas>
+                <h4>Pridaj záznam</h4>
+                <input id="cat" placeholder="Kategória (napr. LAB, RTG, vizita...)">
+                <textarea id="content" placeholder='Obsah JSON, napr. {"test":"CRP","value":120,"unit":"mg/L"}'></textarea>
+                <button onclick="addRecord()">Pridať záznam</button>
             </div>
         </div>
+
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
         <script>
-        let selected = null;
-        async function loadPatients(){
-            const key = document.getElementById('apiKey').value;
-            const res = await fetch('/patients',{headers:{'X-API-Key':key}});
-            const data = await res.json();
-            let html='';
-            data.forEach(p=> html+=`<div onclick="selectPatient('${p.patient_uid}')">${p.patient_uid} ${p.first_name||''}</div>`);
-            document.getElementById('patientList').innerHTML=html;
+        let selectedPatient = null;
+        let latestSummary = '';
+
+        function toggleDark(){
+            document.body.classList.toggle('dark');
         }
+
+        function showTab(id){
+            document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+            document.querySelectorAll('.tabContent').forEach(c=>c.style.display='none');
+            document.querySelector(`.tab[onclick="showTab('${id}')"]`).classList.add('active');
+            document.getElementById(id).style.display='block';
+        }
+
+        async function loadPatients(){
+            const apiKey = document.getElementById('apiKey').value;
+            const res = await fetch('/patients', { headers: { 'X-API-Key': apiKey }});
+            const data = await res.json();
+            const list = document.getElementById('patientList');
+            list.innerHTML = '';
+            data.forEach(p=>{
+                const div = document.createElement('div');
+                div.className='patient-item';
+                div.textContent = `${p.patient_uid} - ${p.first_name||''} ${p.last_name||''}`;
+                div.onclick = ()=>loadPatient(p.patient_uid);
+                list.appendChild(div);
+            });
+        }
+
         async function createPatient(){
-            const key=document.getElementById('apiKey').value;
-            const p={patient_uid:uid.value,first_name:fname.value,last_name:lname.value};
-            await fetch('/patients',{method:'POST',headers:{'X-API-Key':key,'Content-Type':'application/json'},body:JSON.stringify(p)});
+            const apiKey = document.getElementById('apiKey').value;
+            const body = {
+                patient_uid: document.getElementById('uid').value,
+                first_name: document.getElementById('fname').value,
+                last_name: document.getElementById('lname').value,
+                gender: document.getElementById('gender').value
+            };
+            await fetch('/patients', { method:'POST', headers:{'Content-Type':'application/json','X-API-Key':apiKey}, body:JSON.stringify(body)});
             loadPatients();
         }
-        async function selectPatient(uid){
-            selected=uid;
-            const key=document.getElementById('apiKey').value;
-            const res=await fetch(`/patients/${uid}/records`,{headers:{'X-API-Key':key}});
-            const data=await res.json();
-            let html='';
-            data.forEach(r=> html+=`${r.category}: ${JSON.stringify(r.content)}<hr>`);
-            document.getElementById('records').innerHTML=html;
-            renderChart(data);
+
+        async function loadPatient(uid){
+            selectedPatient = uid;
+            const apiKey = document.getElementById('apiKey').value;
+            const res = await fetch(`/patients/${uid}/records`, { headers:{'X-API-Key':apiKey} });
+            const data = await res.json();
+            let html = '';
+            let therapyList = [];
+            data.forEach(r=>{
+                const time = new Date(r.timestamp).toLocaleString();
+                html += `<b>${r.category}</b> (${time})<br>${JSON.stringify(r.content)}<hr>`;
+                if(r.category.toLowerCase().includes('lieč')){
+                    therapyList.push(JSON.stringify(r.content));
+                }
+            });
+            document.getElementById('timeline').innerHTML = html || 'Žiadne záznamy';
+            document.getElementById('therapy').innerHTML = therapyList.join('<br>') || 'Žiadna liečba';
+            const ai = await fetch(`/ai/summary/${uid}`, { headers:{'X-API-Key':apiKey}});
+            const sum = await ai.json();
+            latestSummary = sum.discharge_draft;
+            document.getElementById('summary').innerHTML = `<pre>${latestSummary}</pre>`;
         }
+
         async function addRecord(){
-            if(!selected){alert("Vyber pacienta");return;}
-            const key=document.getElementById('apiKey').value;
-            let c; try{c=JSON.parse(content.value);}catch{alert("Neplatný JSON");return;}
-            const body={category:cat.value,timestamp:new Date().toISOString(),content:c};
-            await fetch(`/patients/${selected}/records`,{method:'POST',headers:{'X-API-Key':key,'Content-Type':'application/json'},body:JSON.stringify(body)});
-            selectPatient(selected);
+            if(!selectedPatient){alert('Vyber pacienta.');return;}
+            const apiKey = document.getElementById('apiKey').value;
+            const cat = document.getElementById('cat').value;
+            let content;
+            try{ content = JSON.parse(document.getElementById('content').value); }catch{ alert('Neplatný JSON'); return; }
+            await fetch(`/patients/${selectedPatient}/records`, {
+                method:'POST',
+                headers:{'Content-Type':'application/json','X-API-Key':apiKey},
+                body:JSON.stringify({ category:cat, timestamp:new Date().toISOString(), content:content })
+            });
+            loadPatient(selectedPatient);
         }
-        async function generateAI(){
-            const key=document.getElementById('apiKey').value;
-            const res=await fetch(`/ai/summary/${selected}`,{headers:{'X-API-Key':key}});
-            const data=await res.json();
-            document.getElementById('ai').textContent=data.discharge_draft;
-        }
-        function renderChart(data){
-            const ctx=document.getElementById('chartDiv');
-            const labs=data.filter(r=>r.category.toLowerCase()==='lab');
-            if(!labs.length)return;
-            const labels=labs.map(r=>new Date(r.timestamp).toLocaleDateString());
-            const values=labs.map(r=>r.content.value||0);
-            new Chart(ctx,{type:'line',data:{labels:labels,datasets:[{label:'Lab trend',data:values,borderColor:'#1e4e9a'}]}});
+
+        function exportPDF(){
+            if(!latestSummary){alert('Najprv načítaj AI summary');return;}
+            const element = document.createElement('div');
+            element.innerHTML = `<h2>Prepúšťacia správa</h2><pre>${latestSummary}</pre>`;
+            html2pdf().from(element).save(`discharge_${selectedPatient}.pdf`);
         }
         </script>
-    </body></html>
+    </body>
+    </html>
     """
