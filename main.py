@@ -1,347 +1,320 @@
-# main.py
-import os
-import logging
-from typing import Optional, List
+from fastapi import FastAPI, HTTPException, Header
+from fastapi.responses import HTMLResponse
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, JSON, ForeignKey
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from datetime import datetime
+import os
 
-from fastapi import FastAPI, Depends, Header, HTTPException, Query
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
+# --------------------------------------------------------------------
+# SETTINGS
+# --------------------------------------------------------------------
+app = FastAPI(title="MedAI Backend v2.2")
 
-from pydantic import BaseModel, Field
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, select, text
-from sqlalchemy.orm import declarative_base, relationship, sessionmaker
+API_KEY = os.getenv("API_KEY", "m3dAI_7YtqgY2WJr9vQdXz")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/medai")
 
-# ------------------------------------------------------------------------------
-# Konfigurácia & logovanie
-# ------------------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-
-API_KEY_ENV = os.getenv("API_KEY", "m3dAI_7YtqgY2WJr9vQdXz")  # default len pre dev
-DB_URL = os.getenv("DATABASE_URL", "")
-
-# Railway Postgres často vyžaduje SSL. Doplň, ak chýba.
-if DB_URL.startswith("postgresql://") and "sslmode=" not in DB_URL:
-    joiner = "&" if "?" in DB_URL else "?"
-    DB_URL = f"{DB_URL}{joiner}sslmode=require"
-
-if not DB_URL:
-    logging.warning("DATABASE_URL nie je nastavené – app pôjde, ale DB volania spadnú.")
-
-engine = create_engine(DB_URL, pool_pre_ping=True, future=True)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
-app = FastAPI(title="MedAI Backend 2.2 (DB)")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
-)
-
-# ------------------------------------------------------------------------------
-# DB modely
-# ------------------------------------------------------------------------------
+# --------------------------------------------------------------------
+# DATABASE MODELS
+# --------------------------------------------------------------------
 class Patient(Base):
     __tablename__ = "patients"
     id = Column(Integer, primary_key=True)
-    uid = Column(String(50), unique=True, index=True, nullable=False)
-    first_name = Column(String(100), default="")
-    last_name = Column(String(100), default="")
-    records = relationship("Record", back_populates="patient", cascade="all,delete")
+    patient_uid = Column(String, unique=True)
+    first_name = Column(String)
+    last_name = Column(String)
+    gender = Column(String)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    records = relationship("Record", back_populates="patient")
+
 
 class Record(Base):
     __tablename__ = "records"
     id = Column(Integer, primary_key=True)
-    patient_id = Column(Integer, ForeignKey("patients.id"), nullable=False, index=True)
-    category = Column(String(30), default="NOTE")  # LAB/EKG/RTG/NOTE
-    content = Column(Text, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    patient_id = Column(Integer, ForeignKey("patients.id"))
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    category = Column(String)
+    content = Column(JSON)
     patient = relationship("Patient", back_populates="records")
 
-# ------------------------------------------------------------------------------
-# Schémy (Pydantic)
-# ------------------------------------------------------------------------------
-class PatientIn(BaseModel):
-    uid: str = Field(..., examples=["P001"])
-    first_name: Optional[str] = ""
-    last_name: Optional[str] = ""
 
-class RecordIn(BaseModel):
-    content: str = Field(..., description="Obsah textu alebo JSON")
-    category: Optional[str] = None  # ak None, skúsime heuristiku
+Base.metadata.create_all(bind=engine)
 
-# ------------------------------------------------------------------------------
-# API key ochrana (header aj query)
-# ------------------------------------------------------------------------------
-def require_api_key(
-    api_key_header: Optional[str] = Header(default=None, alias="x-api-key"),
-    api_key_query: Optional[str] = Query(default=None, alias="api_key"),
-):
-    key = api_key_header or api_key_query
-    if not key or key != API_KEY_ENV:
-        raise HTTPException(status_code=401, detail="unauthorized")
-    return True
 
-# ------------------------------------------------------------------------------
-# Pomocné – heuristika kategórie
-# ------------------------------------------------------------------------------
-def detect_category(text_value: str) -> str:
-    t = text_value.lower()
-    if any(k in t for k in ["crp", "hb", "hemoglobin", "leu", "k+", "na+", "mg/l", "mmol/l"]):
-        return "LAB"
-    if any(k in t for k in ["ekg", "sinus", "tachykard", "bradykard", "qrs", "st "]):
-        return "EKG"
-    if any(k in t for k in ["rtg", "rentgen", "x-ray", "skiagraf"]):
-        return "RTG"
-    return "NOTE"
+# --------------------------------------------------------------------
+# SECURITY
+# --------------------------------------------------------------------
+def check_key(x_api_key: str | None):
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid API key")
 
-# ------------------------------------------------------------------------------
-# Životný cyklus & diagnostika
-# ------------------------------------------------------------------------------
-@app.on_event("startup")
-def on_startup():
-    try:
-        Base.metadata.create_all(bind=engine)
-        logging.info("DB schema ready")
-    except Exception as e:
-        logging.exception("DB init failed: %s", e)
 
+# --------------------------------------------------------------------
+# ENDPOINTS
+# --------------------------------------------------------------------
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-@app.get("/diag/pingdb", dependencies=[Depends(require_api_key)])
-def ping_db():
-    try:
-        with SessionLocal() as db:
-            db.execute(text("SELECT 1"))
-        return {"db": "ok"}
-    except Exception as e:
-        logging.exception("DB ping failed")
-        raise HTTPException(status_code=500, detail=f"db_error: {e}")
 
-# ------------------------------------------------------------------------------
-# Pacienti
-# ------------------------------------------------------------------------------
-@app.get("/patients", dependencies=[Depends(require_api_key)])
-def list_patients():
-    try:
-        with SessionLocal() as db:
-            pts = db.execute(select(Patient).order_by(Patient.uid.asc())).scalars().all()
-            return [{"uid": p.uid, "first_name": p.first_name, "last_name": p.last_name} for p in pts]
-    except Exception as e:
-        logging.exception("GET /patients failed")
-        raise HTTPException(status_code=500, detail=f"server_error: {e}")
+@app.post("/patients")
+def create_patient(patient: dict, x_api_key: str | None = Header(default=None)):
+    check_key(x_api_key)
+    with SessionLocal() as s:
+        p = Patient(
+            patient_uid=patient["patient_uid"],
+            first_name=patient.get("first_name"),
+            last_name=patient.get("last_name"),
+            gender=patient.get("gender", "M"),
+        )
+        s.add(p)
+        s.commit()
+        return {"id": p.id, "patient_uid": p.patient_uid}
 
-@app.post("/patients", dependencies=[Depends(require_api_key)])
-def create_patient(p: PatientIn):
-    try:
-        with SessionLocal() as db:
-            exists = db.execute(select(Patient).where(Patient.uid == p.uid)).scalar_one_or_none()
-            if exists:
-                raise HTTPException(status_code=409, detail="patient_exists")
-            patient = Patient(uid=p.uid.strip(), first_name=p.first_name.strip(), last_name=p.last_name.strip())
-            db.add(patient)
-            db.commit()
-            return {"ok": True, "uid": patient.uid}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.exception("POST /patients failed")
-        raise HTTPException(status_code=500, detail=f"server_error: {e}")
 
-# ------------------------------------------------------------------------------
-# Záznamy
-# ------------------------------------------------------------------------------
-@app.get("/patients/{uid}/records", dependencies=[Depends(require_api_key)])
-def list_records(uid: str):
-    try:
-        with SessionLocal() as db:
-            patient = db.execute(select(Patient).where(Patient.uid == uid)).scalar_one_or_none()
-            if not patient:
-                raise HTTPException(status_code=404, detail="patient_not_found")
-            recs = db.execute(
-                select(Record).where(Record.patient_id == patient.id).order_by(Record.created_at.desc())
-            ).scalars().all()
-            return [
-                {
-                    "id": r.id,
-                    "category": r.category,
-                    "content": r.content,
-                    "created_at": r.created_at.isoformat() + "Z",
-                }
-                for r in recs
-            ]
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.exception("GET /patients/{uid}/records failed")
-        raise HTTPException(status_code=500, detail=f"server_error: {e}")
+@app.get("/patients")
+def list_patients(x_api_key: str | None = Header(default=None)):
+    check_key(x_api_key)
+    with SessionLocal() as s:
+        rows = s.query(Patient).order_by(Patient.created_at.desc()).all()
+        return [
+            {
+                "patient_uid": r.patient_uid,
+                "first_name": r.first_name,
+                "last_name": r.last_name,
+                "gender": r.gender,
+                "created_at": r.created_at,
+            }
+            for r in rows
+        ]
 
-@app.post("/patients/{uid}/records", dependencies=[Depends(require_api_key)])
-def add_record(uid: str, body: RecordIn):
-    try:
-        with SessionLocal() as db:
-            patient = db.execute(select(Patient).where(Patient.uid == uid)).scalar_one_or_none()
-            if not patient:
-                raise HTTPException(status_code=404, detail="patient_not_found")
-            category = (body.category or "").strip().upper() or detect_category(body.content or "")
-            rec = Record(patient_id=patient.id, category=category, content=body.content.strip())
-            db.add(rec)
-            db.commit()
-            return {"ok": True, "id": rec.id, "category": rec.category}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.exception("POST /patients/{uid}/records failed")
-        raise HTTPException(status_code=500, detail=f"server_error: {e}")
 
-# ------------------------------------------------------------------------------
-# Web UI (Dashboard 2.2)
-# ------------------------------------------------------------------------------
-INDEX_HTML = """
-<!doctype html>
-<html lang="sk">
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>MedAI Dashboard 2.2 (DB)</title>
-  <style>
-    body{font-family:system-ui,Segoe UI,Roboto,Arial;background:#f6f8fb;margin:0}
-    .header{background:#134a9a;color:#fff;padding:14px 18px;display:flex;gap:12px;align-items:center}
-    .header h1{font-size:20px;margin:0}
-    .badge{background:#19c37d;color:#083d31;padding:4px 10px;border-radius:999px;font-weight:600}
-    .wrap{padding:16px;max-width:960px;margin:0 auto}
-    .card{background:#fff;border-radius:12px;box-shadow:0 3px 14px rgba(0,0,0,.06);padding:16px;margin:12px 0}
-    .row{display:flex;gap:10px;flex-wrap:wrap}
-    .inp{width:100%;padding:10px;border:1px solid #dce4f0;border-radius:8px}
-    .btn{background:#134a9a;color:#fff;border:none;border-radius:8px;padding:10px 14px;cursor:pointer}
-    .err{color:#c0392b;margin-top:8px}
-    .ok{color:#16a085;margin-top:8px}
-    ul{margin-top:10px}
-    li{cursor:pointer}
-    pre{white-space:pre-wrap}
-  </style>
-</head>
-<body>
-  <div class="header">
-    <h1>MedAI Dashboard 2.2</h1>
-    <input id="apiKey" class="inp" placeholder="API Key" style="max-width:260px"/>
-    <span id="online" class="badge">online</span>
-  </div>
+@app.post("/patients/{patient_uid}/records")
+def add_record(patient_uid: str, record: dict, x_api_key: str | None = Header(default=None)):
+    check_key(x_api_key)
+    with SessionLocal() as s:
+        p = s.query(Patient).filter(Patient.patient_uid == patient_uid).first()
+        if not p:
+            raise HTTPException(404, "Patient not found")
+        r = Record(
+            patient=p,
+            category=record["category"],
+            timestamp=datetime.fromisoformat(record["timestamp"].replace("Z", "+00:00")),
+            content=record["content"],
+        )
+        s.add(r)
+        s.commit()
+        return {"status": "record added"}
 
-  <div class="wrap">
 
-    <div class="card">
-      <h2>Pacienti</h2>
-      <input id="uid" class="inp" placeholder="P001"/>
-      <div class="row">
-        <input id="first" class="inp" placeholder="Meno" style="max-width:220px"/>
-        <input id="last"  class="inp" placeholder="Priezvisko" style="max-width:220px"/>
-      </div>
-      <div class="row">
-        <button class="btn" onclick="createPatient()">Vytvoriť</button>
-        <button class="btn" onclick="loadPatients()">Načítať pacientov</button>
-        <button class="btn" onclick="loadRecords()">Načítať záznamy</button>
-      </div>
-      <div id="pError" class="err"></div>
-      <ul id="plist"></ul>
-    </div>
+@app.get("/patients/{patient_uid}/records")
+def get_records(patient_uid: str, x_api_key: str | None = Header(default=None)):
+    check_key(x_api_key)
+    with SessionLocal() as s:
+        p = s.query(Patient).filter(Patient.patient_uid == patient_uid).first()
+        if not p:
+            raise HTTPException(404, "Patient not found")
+        recs = s.query(Record).filter(Record.patient == p).order_by(Record.timestamp).all()
+        return [
+            {"category": r.category, "timestamp": r.timestamp, "content": r.content}
+            for r in recs
+        ]
 
-    <div class="card">
-      <h2>Záznamy</h2>
-      <textarea id="content" class="inp" rows="4" placeholder='Obsah (text alebo JSON)'></textarea>
-      <div class="row">
-        <button class="btn" onclick="saveRecord()">Uložiť</button>
-      </div>
-      <div id="rError" class="err"></div>
-      <div id="rList"></div>
-      <p style="color:#666">TIP: „CRP 120 mg/L“ → kategória <b>LAB</b> sa určí automaticky.</p>
-    </div>
 
-  </div>
+# --------------------------------------------------------------------
+# HEURISTIC AI SUMMARY
+# --------------------------------------------------------------------
+@app.get("/ai/summary/{patient_uid}")
+def ai_summary(patient_uid: str, x_api_key: str | None = Header(default=None)):
+    check_key(x_api_key)
+    with SessionLocal() as s:
+        p = s.query(Patient).filter(Patient.patient_uid == patient_uid).first()
+        if not p:
+            raise HTTPException(404, "Patient not found")
+        recs = s.query(Record).filter(Record.patient == p).order_by(Record.timestamp).all()
 
-<script>
-const base = location.origin;
-const $ = (id) => document.getElementById(id);
-const key = () => ($("apiKey").value || "").trim();
+        summary_lines = []
+        diagnoses, therapies, labs, visits = [], [], [], []
 
-function showErr(id, msg) { $(id).textContent = msg || ""; }
-function clearErrs() { showErr("pError",""); showErr("rError",""); }
+        for r in recs:
+            line = f"- {r.timestamp.strftime('%Y-%m-%d %H:%M')} {r.category}: {r.content}"
+            summary_lines.append(line)
+            c = r.category.lower()
+            if "diag" in c:
+                diagnoses.append(str(r.content))
+            if "lie" in c:
+                therapies.append(str(r.content))
+            if "lab" in c:
+                labs.append(r)
+            if "viz" in c:
+                visits.append(r)
 
-async function api(path, opts={}) {
-  const k = key();
-  const headers = Object.assign({"Content-Type":"application/json"}, k ? {"x-api-key": k} : {});
-  const res = await fetch(base + path, Object.assign({headers}, opts));
-  if (!res.ok) {
-    let detail = "";
-    try { const j = await res.json(); detail = j.detail || res.statusText; } catch(e) { detail = res.statusText; }
-    throw new Error(detail);
-  }
-  const ct = res.headers.get("content-type") || "";
-  return ct.includes("application/json") ? res.json() : res.text();
-}
+        # štatistiky
+        num_days = (recs[-1].timestamp - recs[0].timestamp).days + 1 if recs else 0
+        stats = {
+            "pocet_zaznamov": len(recs),
+            "pocet_vizit": len(visits),
+            "pocet_lab": len(labs),
+            "pocet_liecby": len(therapies),
+            "dlzka_hospitalizacie_dni": num_days,
+        }
 
-async function loadPatients() {
-  clearErrs();
-  try {
-    const data = await api("/patients");
-    const ul = $("plist"); ul.innerHTML = "";
-    data.forEach(p => {
-      const li = document.createElement("li");
-      li.textContent = `${p.uid} — ${p.first_name} ${p.last_name}`.trim();
-      li.onclick = () => { $("uid").value = p.uid; loadRecords(); };
-      ul.appendChild(li);
-    });
-  } catch(e) { showErr("pError", e.message); }
-}
+        return {
+            "diagnoses": "\n".join(diagnoses) or "bez diagnózy",
+            "timeline": "\n".join(summary_lines),
+            "stats": stats,
+            "labs": [{"time": r.timestamp.isoformat(), "data": r.content} for r in labs],
+            "discharge_draft": f"""
+PREPÚŠŤACIA SPRÁVA – NÁVRH
 
-async function createPatient() {
-  clearErrs();
-  const uid = $("uid").value.trim();
-  const first = $("first").value.trim();
-  const last  = $("last").value.trim();
-  if (!uid) { showErr("pError","Zadaj UID (napr. P001)"); return; }
-  try {
-    await api("/patients", { method:"POST", body: JSON.stringify({uid, first_name:first, last_name:last}) });
-    await loadPatients();
-  } catch(e) { showErr("pError", e.message); }
-}
+Pacient: {p.first_name} {p.last_name} ({p.patient_uid})
+Pohlavie: {p.gender}
 
-async function loadRecords() {
-  clearErrs();
-  const uid = $("uid").value.trim();
-  if (!uid) { showErr("pError","Zadaj UID pacienta"); return; }
-  try {
-    const recs = await api(`/patients/${encodeURIComponent(uid)}/records`);
-    const box = $("rList");
-    box.innerHTML = recs.map(r => 
-      `<div style="border:1px solid #eee;border-radius:8px;padding:8px;margin:6px 0">
-        <div><b>${r.category}</b> • <small>${r.created_at}</small></div>
-        <pre>${(r.content || "").replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))}</pre>
-      </div>`).join("");
-  } catch(e) { showErr("pError", e.message); }
-}
+Diagnózy:
+{'; '.join(diagnoses) or 'bez diagnózy'}
 
-async function saveRecord() {
-  clearErrs();
-  const uid = $("uid").value.trim();
-  const content = $("content").value.trim();
-  if (!uid) { showErr("rError","Zadaj UID pacienta"); return; }
-  if (!content) { showErr("rError","Zadaj obsah"); return; }
-  try {
-    await api(`/patients/${encodeURIComponent(uid)}/records`, { method:"POST", body: JSON.stringify({content}) });
-    $("content").value = "";
-    await loadRecords();
-  } catch(e) { showErr("rError", e.message); }
-}
-</script>
-</body>
-</html>
-"""
+Chronologický priebeh:
+{chr(10).join(summary_lines)}
 
+Liečba:
+{chr(10).join(therapies) or 'bez liečby'}
+
+Dĺžka hospitalizácie: {num_days} dní
+            """,
+        }
+
+
+# --------------------------------------------------------------------
+# FRONTEND DASHBOARD 2.2
+# --------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
-def index():
-    return HTMLResponse(INDEX_HTML)
+def ui_dashboard():
+    return """
+    <html>
+    <head>
+        <title>MedAI Dashboard 2.2</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+        <style>
+            :root {
+                --bg: #f2f4f8;
+                --text: #111;
+                --card: #fff;
+                --accent: #1e4e9a;
+                --border: #ccc;
+            }
+            body.dark {
+                --bg: #121212;
+                --text: #e0e0e0;
+                --card: #1f1f1f;
+                --accent: #4a90e2;
+                --border: #333;
+            }
+            body { font-family: 'Inter', sans-serif; margin: 0; background: var(--bg); color: var(--text); transition: 0.3s; }
+            header { background: var(--accent); color: white; padding: 12px 18px; display: flex; justify-content: space-between; align-items: center; }
+            h1 { margin: 0; font-size: 22px; }
+            .container { display: flex; flex-wrap: wrap; padding: 10px; }
+            .sidebar { flex: 1; min-width: 260px; background: var(--card); margin: 10px; padding: 10px; border-radius: 8px; height: 88vh; overflow-y: auto; border: 1px solid var(--border); }
+            .main { flex: 3; min-width: 300px; background: var(--card); margin: 10px; padding: 15px; border-radius: 8px; border: 1px solid var(--border); }
+            button { background: var(--accent); color: white; border: none; padding: 8px 12px; border-radius: 6px; cursor: pointer; margin-top: 5px; }
+            input, textarea, select { width: 100%; margin: 4px 0; padding: 6px; border: 1px solid var(--border); border-radius: 4px; background: var(--card); color: var(--text); }
+            .patient-item { padding: 8px; border-bottom: 1px solid var(--border); cursor: pointer; }
+            .tab { display:inline-block; padding:6px 10px; border-radius:5px; margin-right:5px; cursor:pointer; background:#e4e8ef; }
+            .tab.active { background: var(--accent); color: white; }
+            .tabContent { display:none; }
+            pre { white-space: pre-wrap; background: #0001; padding: 10px; border-radius: 6px; color: var(--text); }
+            canvas { max-width:100%; background:#fff1; border-radius:8px; margin-top:10px; }
+        </style>
+    </head>
+    <body>
+        <header><h1>🩺 MedAI Dashboard 2.2</h1><button onclick="toggleDark()">🌙 Režim</button></header>
+
+        <div class="container">
+            <div class="sidebar">
+                <h3>Pacienti</h3>
+                <input id="apiKey" placeholder="API Key">
+                <button onclick="loadPatients()">Načítať pacientov</button>
+                <div id="patientList"></div>
+                <hr><h4>Nový pacient</h4>
+                <input id="uid" placeholder="UID">
+                <input id="fname" placeholder="Meno">
+                <input id="lname" placeholder="Priezvisko">
+                <select id="gender"><option value="M">M</option><option value="F">F</option></select>
+                <button onclick="createPatient()">Vytvoriť</button>
+            </div>
+
+            <div class="main">
+                <div>
+                    <span class="tab active" onclick="showTab('timeline')">📆 Priebeh</span>
+                    <span class="tab" onclick="showTab('summary')">🧠 AI Summary</span>
+                    <span class="tab" onclick="showTab('therapy')">💊 Liečba</span>
+                    <span class="tab" onclick="showTab('stats')">📊 Štatistiky</span>
+                    <button onclick="exportPDF()">📄 Export PDF</button>
+                </div>
+                <div id="timeline" class="tabContent" style="display:block;"></div>
+                <div id="summary" class="tabContent"></div>
+                <div id="therapy" class="tabContent"></div>
+                <div id="stats" class="tabContent">
+                    <h3>Štatistiky hospitalizácie</h3>
+                    <div id="statsBox"></div>
+                    <canvas id="labChart"></canvas>
+                </div>
+                <hr><h4>Pridaj záznam</h4>
+                <input id="cat" placeholder="Kategória">
+                <textarea id="content" placeholder='Obsah JSON (napr. {"test":"CRP","value":120,"unit":"mg/L"})'></textarea>
+                <button onclick="addRecord()">Pridať</button>
+            </div>
+        </div>
+
+        <script>
+        let selectedPatient=null;let latestSummary='';let chart=null;
+        function toggleDark(){document.body.classList.toggle('dark');}
+        function showTab(id){document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+            document.querySelectorAll('.tabContent').forEach(c=>c.style.display='none');
+            document.querySelector(`.tab[onclick="showTab('${id}')"]`).classList.add('active');
+            document.getElementById(id).style.display='block';}
+        async function loadPatients(){
+            const apiKey=document.getElementById('apiKey').value;
+            const res=await fetch('/patients',{headers:{'X-API-Key':apiKey}});
+            const data=await res.json();const list=document.getElementById('patientList');list.innerHTML='';
+            data.forEach(p=>{const div=document.createElement('div');div.className='patient-item';
+                div.textContent=`${p.patient_uid} - ${p.first_name||''} ${p.last_name||''}`;
+                div.onclick=()=>loadPatient(p.patient_uid);list.appendChild(div);});}
+        async function createPatient(){
+            const apiKey=document.getElementById('apiKey').value;
+            const body={patient_uid:uid.value,first_name:fname.value,last_name:lname.value,gender:gender.value};
+            await fetch('/patients',{method:'POST',headers:{'Content-Type':'application/json','X-API-Key':apiKey},body:JSON.stringify(body)});loadPatients();}
+        async function loadPatient(uid){
+            selectedPatient=uid;const apiKey=document.getElementById('apiKey').value;
+            const res=await fetch(`/ai/summary/${uid}`,{headers:{'X-API-Key':apiKey}});const data=await res.json();
+            latestSummary=data.discharge_draft;
+            document.getElementById('summary').innerHTML=`<pre>${latestSummary}</pre>`;
+            document.getElementById('timeline').innerHTML=`<pre>${data.timeline}</pre>`;
+            document.getElementById('therapy').innerHTML=`<pre>${data.diagnoses}</pre>`;
+            document.getElementById('statsBox').innerHTML=`<pre>${JSON.stringify(data.stats,null,2)}</pre>`;
+            if(data.labs.length>0){
+                const values=data.labs.map(l=>l.data.value||0);
+                const labels=data.labs.map(l=>new Date(l.time).toLocaleDateString());
+                if(chart)chart.destroy();
+                chart=new Chart(document.getElementById('labChart'),{type:'line',data:{labels:labels,datasets:[{label:'CRP / hodnoty LAB',data:values,borderColor:'#1e4e9a',fill:false}]},options:{scales:{y:{beginAtZero:true}}}});
+            }}
+        async function addRecord(){
+            if(!selectedPatient){alert('Vyber pacienta');return;}
+            const apiKey=document.getElementById('apiKey').value;const cat=document.getElementById('cat').value;
+            let content;try{content=JSON.parse(document.getElementById('content').value);}catch{alert('Neplatný JSON');return;}
+            await fetch(`/patients/${selectedPatient}/records`,{method:'POST',headers:{'Content-Type':'application/json','X-API-Key':apiKey},
+                body:JSON.stringify({category:cat,timestamp:new Date().toISOString(),content:content})});
+            loadPatient(selectedPatient);}
+        function exportPDF(){
+            if(!latestSummary){alert('Najprv načítaj AI summary');return;}
+            const element=document.createElement('div');
+            element.innerHTML=`<h2>Prepúšťacia správa</h2><pre>${latestSummary}</pre>`;
+            html2pdf().from(element).save(`discharge_${selectedPatient}.pdf`);}
+        </script>
+    </body></html>
+    """
