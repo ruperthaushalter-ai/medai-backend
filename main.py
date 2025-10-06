@@ -1,220 +1,302 @@
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import HTMLResponse
+import os
+from datetime import datetime
+from typing import Optional, List
+
+from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from datetime import datetime
-import os, json
+from sqlalchemy import (
+    create_engine, Column, Integer, String, Text, DateTime, ForeignKey
+)
+from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
 
-app = FastAPI(title="MedAI Dashboard 2.3")
+# -------------------------
+# Konfigurácia
+# -------------------------
+API_KEY = os.getenv("API_KEY", "m3dAI_7YtgqY2WJr9vQdXz")
+DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("DATABASE_URL".upper()) or os.getenv("DATABASE_URL".lower())
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL nie je nastavené (Railway → Variables).")
 
-API_KEY = os.getenv("API_KEY", "m3dAI_7YtqgY2WJr9vQdXz")
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+Base = declarative_base()
+
+app = FastAPI(title="MedAI v2.2 (stable)", version="2.2.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
 
-# ====== MODELY ======
-class Patient(BaseModel):
+# -------------------------
+# DB modely
+# -------------------------
+class Patient(Base):
+    __tablename__ = "patients"
+    id = Column(Integer, primary_key=True)
+    patient_uid = Column(String(64), unique=True, index=True, nullable=False)
+    first_name = Column(String(120))
+    last_name = Column(String(120))
+    gender = Column(String(8), default="U")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    records = relationship("Record", back_populates="patient", cascade="all, delete-orphan")
+
+class Record(Base):
+    __tablename__ = "records"
+    id = Column(Integer, primary_key=True)
+    patient_id = Column(Integer, ForeignKey("patients.id"), index=True, nullable=False)
+    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
+    category = Column(String(32), default="NOTE")
+    content = Column(Text, nullable=False)
+
+    patient = relationship("Patient", back_populates="records")
+
+Base.metadata.create_all(bind=engine)
+
+# -------------------------
+# Schémy
+# -------------------------
+class PatientIn(BaseModel):
     patient_uid: str
-    first_name: str | None = None
-    last_name: str | None = None
-    gender: str | None = None
+    first_name: str
+    last_name: str
+    gender: Optional[str] = "U"
 
-class Record(BaseModel):
-    category: str | None = None
+class PatientOut(BaseModel):
+    id: int
+    patient_uid: str
+    class Config:
+        from_attributes = True
+
+class RecordIn(BaseModel):
+    timestamp: Optional[str] = None  # ISO8601; ak None → teraz
+    category: Optional[str] = None   # ak None → autodetekcia
+    content: str
+
+class RecordOut(BaseModel):
+    id: int
     timestamp: str
-    content: dict | str
+    category: str
+    content: str
+    class Config:
+        from_attributes = True
 
-patients = {}
-records = {}
+# -------------------------
+# Helpers
+# -------------------------
+def get_db() -> Session:
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
-# ====== AUTOMATICKÁ DETEKCIA KATEGÓRIE ======
-def detect_category(content):
-    text = str(content).lower()
-    if any(k in text for k in ["crp", "hb", "alt", "ast", "value", "mg/l", "mmol", "g/l"]):
-        return "LAB"
-    elif any(k in text for k in ["rtg", "röntgen", "rentgen"]):
-        return "RTG"
-    elif "ekg" in text:
-        return "EKG"
-    elif any(k in text for k in ["ceftriax", "lieč", "podan", "infuz", "antibiotik"]):
-        return "THERAPY"
-    elif any(k in text for k in ["teplota", "tlak", "sat", "frekv", "pulse"]):
-        return "VITALS"
-    else:
-        return "NOTE"
+def require_api_key(x_api_key: str = Header(default=None)):
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
 
-# ====== API ENDPOINTY ======
+def detect_category(text: str) -> str:
+    t = (text or "").lower()
+    if any(x in t for x in ["crp", "hb", "leu", "na+", "k+", "mg/l", "mmol"]): return "LAB"
+    if any(x in t for x in ["ekg", "fibril", "tachy", "brady"]): return "EKG"
+    if any(x in t for x in ["rtg", "rentgen", "röntgen", "infiltrát", "pneumon"]): return "RTG"
+    if any(x in t for x in ["podaná", "podan", "ceftriax", "amoxicil", "lieč", "infuz"]): return "THERAPY"
+    return "NOTE"
+
+# -------------------------
+# API v2.2
+# -------------------------
 @app.get("/health")
-def health(): return {"status": "OK"}
+def health():
+    return {"status": "ok"}
 
-@app.get("/patients")
-def get_patients(request: Request):
-    if request.headers.get("X-API-Key") != API_KEY:
-        raise HTTPException(403, "Invalid API Key")
-    return list(patients.values())
+@app.post("/patients", response_model=PatientOut, dependencies=[Depends(require_api_key)])
+def create_patient(body: PatientIn, db: Session = Depends(get_db)):
+    exists = db.query(Patient).filter(Patient.patient_uid == body.patient_uid).first()
+    if exists:
+        return PatientOut.model_validate(exists)
+    p = Patient(
+        patient_uid=body.patient_uid.strip(),
+        first_name=body.first_name.strip(),
+        last_name=body.last_name.strip(),
+        gender=(body.gender or "U").upper()
+    )
+    db.add(p); db.commit(); db.refresh(p)
+    return PatientOut.model_validate(p)
 
-@app.post("/patients")
-def create_patient(request: Request, p: Patient):
-    if request.headers.get("X-API-Key") != API_KEY:
-        raise HTTPException(403, "Invalid API Key")
-    patients[p.patient_uid] = p.dict()
-    records[p.patient_uid] = []
-    return {"status": "created", "uid": p.patient_uid}
+@app.get("/patients/{patient_uid}/records", response_model=List[RecordOut], dependencies=[Depends(require_api_key)])
+def list_records(patient_uid: str, db: Session = Depends(get_db)):
+    p = db.query(Patient).filter(Patient.patient_uid == patient_uid).first()
+    if not p:
+        raise HTTPException(404, detail="Patient not found")
+    recs = (
+        db.query(Record)
+        .filter(Record.patient_id == p.id)
+        .order_by(Record.timestamp.asc(), Record.id.asc())
+        .all()
+    )
+    return [RecordOut(id=r.id, timestamp=r.timestamp.isoformat(), category=r.category, content=r.content) for r in recs]
 
-@app.get("/patients/{uid}/records")
-def get_records(uid: str, request: Request):
-    if request.headers.get("X-API-Key") != API_KEY:
-        raise HTTPException(403, "Invalid API Key")
-    return records.get(uid, [])
+@app.post("/patients/{patient_uid}/records", response_model=RecordOut, dependencies=[Depends(require_api_key)])
+def add_record(patient_uid: str, body: RecordIn, db: Session = Depends(get_db)):
+    p = db.query(Patient).filter(Patient.patient_uid == patient_uid).first()
+    if not p:
+        raise HTTPException(404, detail="Patient not found")
+    ts = datetime.fromisoformat(body.timestamp) if body.timestamp else datetime.utcnow()
+    cat = body.category or detect_category(body.content)
+    r = Record(patient_id=p.id, timestamp=ts, category=cat, content=body.content.strip())
+    db.add(r); db.commit(); db.refresh(r)
+    return RecordOut(id=r.id, timestamp=r.timestamp.isoformat(), category=r.category, content=r.content)
 
-@app.post("/patients/{uid}/records")
-def add_record(uid: str, request: Request, r: Record):
-    if request.headers.get("X-API-Key") != API_KEY:
-        raise HTTPException(403, "Invalid API Key")
-    if uid not in records:
-        raise HTTPException(404, "Patient not found")
-
-    # automatická kategorizácia
-    if not r.category:
-        r.category = detect_category(r.content)
-
-    records[uid].append(r.dict())
-    return {"status": "added", "detected_category": r.category}
-
-# ====== HEURISTICKÁ AI ======
-@app.get("/ai/summary/{uid}")
-def ai_summary(uid: str, request: Request):
-    if request.headers.get("X-API-Key") != API_KEY:
-        raise HTTPException(403, "Invalid API Key")
-    recs = records.get(uid, [])
-    if not recs:
-        return {"discharge_draft": "Žiadne dáta."}
-
-    days = len(set(r["timestamp"][:10] for r in recs))
-    labs = [r for r in recs if r["category"] == "LAB"]
-    diag = []
-    if any("crp" in str(r["content"]).lower() for r in labs): diag.append("infekcia?")
-    if any("alt" in str(r["content"]).lower() for r in labs): diag.append("hepatopatia?")
-    if any("hb" in str(r["content"]).lower() for r in labs): diag.append("anémia?")
-
-    summary = f"""
-Pacient mal {len(recs)} záznamov počas {days} dní hospitalizácie.
-Z toho {len(labs)} laboratórnych vyšetrení.
-AI detegovala možné diagnózy: {', '.join(diag) if diag else 'bez abnormít'}.
-    """
-    return {"discharge_draft": summary}
-
-# ====== FRONTEND DASHBOARD ======
-@app.get("/", response_class=HTMLResponse)
+# -------------------------
+# Minimal UI (root)
+# -------------------------
+@app.get("/")
 def ui():
     return """
-    <html>
-    <head>
-        <title>MedAI Dashboard 2.3</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-        <style>
-            body { font-family: 'Inter', sans-serif; background:#f4f6fa; color:#111; margin:0; }
-            header { background:#1e4e9a; color:white; padding:10px 20px; display:flex; justify-content:space-between; align-items:center; }
-            .container { display:flex; flex-wrap:wrap; padding:10px; }
-            .panel { background:white; border-radius:8px; margin:8px; padding:12px; flex:1; min-width:320px; box-shadow:0 2px 6px rgba(0,0,0,0.1);}
-            input, textarea { width:100%; margin:5px 0; padding:6px; border:1px solid #ccc; border-radius:4px; }
-            button { background:#1e4e9a; color:white; border:none; padding:6px 12px; border-radius:5px; cursor:pointer; }
-            h3 { margin-top:0; }
-            pre { white-space: pre-wrap; background:#f0f0f0; padding:10px; border-radius:6px; }
-        </style>
-    </head>
-    <body>
-        <header>
-            <h2>🧠 MedAI Dashboard 2.3</h2>
-            <input id="apiKey" placeholder="API Key" style="width:250px;">
-        </header>
+<!doctype html>
+<html lang="sk"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MedAI Dashboard 2.2</title>
+<style>
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;background:#f6f8fb;margin:0}
+.header{background:#134a9a;color:#fff;padding:14px 18px;display:flex;gap:12px;align-items:center}
+.header input{padding:8px;border:none;border-radius:6px;width:260px}
+.wrap{padding:18px;max-width:900px;margin:0 auto}
+.card{background:#fff;border-radius:12px;box-shadow:0 3px 14px rgba(0,0,0,.06);padding:16px;margin:12px 0}
+.btn{background:#134a9a;color:#fff;border:none;border-radius:8px;padding:10px 14px;cursor:pointer}
+.inp{width:100%;padding:10px;border:1px solid #dcdfea;border-radius:8px;margin:6px 0}
+.row{display:flex;gap:10px;flex-wrap:wrap}
+.badge{display:inline-block;background:#eef3ff;color:#134a9a;border-radius:999px;padding:4px 10px;font-size:12px}
+.err{color:#c0392b}
+.ok{color:#16a085}
+table{width:100%;border-collapse:collapse;margin-top:10px}
+th,td{border-bottom:1px solid #eee;text-align:left;padding:8px;font-size:14px}
+small{color:#666}
+</style>
+</head>
+<body>
+  <div class="header">
+    <b>MedAI Dashboard 2.2</b>
+    <input id="apiKey" placeholder="API Key">
+    <span id="status" class="badge">offline</span>
+  </div>
+  <div class="wrap">
 
-        <div class="container">
-            <div class="panel">
-                <h3>Pacienti</h3>
-                <button onclick="loadPatients()">🔄 Načítať</button>
-                <div id="patientList"></div>
-                <hr>
-                <input id="uid" placeholder="UID (P001)">
-                <input id="fname" placeholder="Meno">
-                <input id="lname" placeholder="Priezvisko">
-                <button onclick="createPatient()">➕ Vytvoriť</button>
-            </div>
+    <div class="card">
+      <h3>Pacient</h3>
+      <div class="row">
+        <input id="uid" class="inp" placeholder="UID (napr. P001)" style="max-width:180px">
+        <input id="first" class="inp" placeholder="Meno" style="max-width:220px">
+        <input id="last" class="inp" placeholder="Priezvisko" style="max-width:220px">
+      </div>
+      <div class="row">
+        <button class="btn" onclick="createPatient()">Vytvoriť</button>
+        <button class="btn" onclick="loadRecords()">Načítať záznamy</button>
+        <span id="msg" style="margin-left:8px"></span>
+      </div>
+    </div>
 
-            <div class="panel">
-                <h3>Záznamy</h3>
-                <textarea id="content" placeholder='Obsah (text alebo JSON)'></textarea>
-                <button onclick="addRecord()">💾 Uložiť</button>
-                <hr>
-                <div id="records"></div>
-            </div>
+    <div class="card">
+      <h3>Záznamy</h3>
+      <textarea id="content" class="inp" rows="4" placeholder="Obsah (text alebo JSON)"></textarea>
+      <div class="row">
+        <button class="btn" onclick="saveRecord()">Uložiť</button>
+        <small>TIP: „CRP 120 mg/L“ → kategória LAB sa určí automaticky.</small>
+      </div>
+      <div id="list"></div>
+    </div>
 
-            <div class="panel">
-                <h3>AI Analýza</h3>
-                <button onclick="generateAI()">🧠 Analyzovať</button>
-                <pre id="ai"></pre>
-                <canvas id="chartDiv"></canvas>
-            </div>
-        </div>
+  </div>
 
-        <script>
-        let selected=null;
-        async function loadPatients(){
-            const key=document.getElementById('apiKey').value;
-            const res=await fetch('/patients',{headers:{'X-API-Key':key}});
-            const data=await res.json();
-            let html='';
-            data.forEach(p=> html+=`<div onclick="selectPatient('${p.patient_uid}')">${p.patient_uid} ${p.first_name||''}</div>`);
-            document.getElementById('patientList').innerHTML=html;
-        }
-        async function createPatient(){
-            const key=document.getElementById('apiKey').value;
-            const p={patient_uid:uid.value,first_name:fname.value,last_name:lname.value};
-            await fetch('/patients',{method:'POST',headers:{'X-API-Key':key,'Content-Type':'application/json'},body:JSON.stringify(p)});
-            loadPatients();
-        }
-        async function selectPatient(uid){
-            selected=uid;
-            const key=document.getElementById('apiKey').value;
-            const res=await fetch(`/patients/${uid}/records`,{headers:{'X-API-Key':key}});
-            const data=await res.json();
-            let html='';
-            data.forEach(r=> html+=`<b>${r.category}</b>: ${JSON.stringify(r.content)}<hr>`);
-            document.getElementById('records').innerHTML=html;
-            renderChart(data);
-        }
-        async function addRecord(){
-            if(!selected){alert("Vyber pacienta");return;}
-            const key=document.getElementById('apiKey').value;
-            let contentVal=document.getElementById('content').value;
-            let parsed;
-            try{parsed=JSON.parse(contentVal);}catch{parsed=contentVal;}
-            const body={timestamp:new Date().toISOString(),content:parsed};
-            const res=await fetch(`/patients/${selected}/records`,{method:'POST',headers:{'X-API-Key':key,'Content-Type':'application/json'},body:JSON.stringify(body)});
-            const out=await res.json();
-            alert("Detegovaná kategória: "+out.detected_category);
-            selectPatient(selected);
-        }
-        async function generateAI(){
-            const key=document.getElementById('apiKey').value;
-            const res=await fetch(`/ai/summary/${selected}`,{headers:{'X-API-Key':key}});
-            const data=await res.json();
-            document.getElementById('ai').textContent=data.discharge_draft;
-        }
-        function renderChart(data){
-            const ctx=document.getElementById('chartDiv');
-            const labs=data.filter(r=>r.category==="LAB" && r.content.value);
-            if(!labs.length)return;
-            const labels=labs.map(r=>new Date(r.timestamp).toLocaleDateString());
-            const values=labs.map(r=>r.content.value);
-            new Chart(ctx,{type:'line',data:{labels:labels,datasets:[{label:'Laboratórny trend',data:values,borderColor:'#1e4e9a',fill:false}]}});
-        }
-        </script>
-    </body>
-    </html>
+<script>
+const $ = id => document.getElementById(id);
+const api = (path, opt={})=>{
+  const key = localStorage.getItem('apiKey') || $('apiKey').value;
+  if(!key) throw new Error('Chýba API Key');
+  opt.headers = Object.assign({'x-api-key': key}, opt.headers||{});
+  return fetch(path, opt);
+};
+
+function setStatus(ok){ $('status').textContent = ok ? 'online' : 'offline'; $('status').style.background = ok ? '#e8f7f0' : '#fdeeee'; $('status').style.color = ok ? '#0a7f58' : '#a33'; }
+
+(async()=>{ // inicializácia
+  const storedKey = localStorage.getItem('apiKey'); if(storedKey) $('apiKey').value = storedKey;
+  $('apiKey').addEventListener('change', e=> localStorage.setItem('apiKey', e.target.value));
+  try{ const r = await fetch('/health'); const d = await r.json(); setStatus(d.status==='ok'); }catch(_){ setStatus(false); }
+})();
+
+async function createPatient(){
+  const uid = $('uid').value.trim(), first=$('first').value.trim(), last=$('last').value.trim();
+  if(!uid || !first || !last){ $('msg').innerHTML = '<span class="err">Vyplň UID, meno, priezvisko.</span>'; return; }
+  try{
+    const res = await api('/patients', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ patient_uid: uid, first_name:first, last_name:last, gender:'U' })
+    });
+    if(!res.ok){ const t = await res.text(); throw new Error(t); }
+    const p = await res.json();
+    $('msg').innerHTML = '<span class="ok">Pacient uložený: '+p.patient_uid+'</span>';
+    localStorage.setItem('lastUID', uid);
+    await loadRecords();
+  }catch(e){ $('msg').innerHTML = '<span class="err">Chyba: '+e.message+'</span>'; }
+}
+
+async function loadRecords(){
+  const uid = $('uid').value.trim() || localStorage.getItem('lastUID');
+  if(!uid){ $('msg').innerHTML = '<span class="err">Zadaj UID pacienta.</span>'; return; }
+  $('uid').value = uid; // synchronizuj
+  try{
+    const res = await api('/patients/'+encodeURIComponent(uid)+'/records');
+    const data = await res.json();
+    renderTable(data);
+    $('msg').innerHTML = '<span class="ok">Načítané: '+data.length+' záznamov.</span>';
+  }catch(e){ $('msg').innerHTML = '<span class="err">Chyba: '+e.message+'</span>'; }
+}
+
+async function saveRecord(){
+  const uid = $('uid').value.trim() || localStorage.getItem('lastUID');
+  if(!uid){ $('msg').innerHTML = '<span class="err">Najprv vytvor / zadaj UID pacienta.</span>'; return; }
+  const raw = $('content').value.trim();
+  if(!raw){ $('msg').innerHTML = '<span class="err">Prázdny obsah.</span>'; return; }
+
+  // Podpora JSON aj čistého textu
+  let payload = { content: raw };
+  try{
+    const j = JSON.parse(raw);
+    payload = { content: j.content || raw, category: j.category || null, timestamp: j.timestamp || null };
+  }catch(_){}
+
+  try{
+    const res = await api('/patients/'+encodeURIComponent(uid)+'/records', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)
+    });
+    if(!res.ok){ const t = await res.text(); throw new Error(t); }
+    $('content').value = '';
+    await loadRecords();
+    $('msg').innerHTML = '<span class="ok">Záznam uložený.</span>';
+  }catch(e){ $('msg').innerHTML = '<span class="err">Chyba: '+e.message+'</span>'; }
+}
+
+function renderTable(items){
+  if(!items || !items.length){ $('list').innerHTML = '<small>Žiadne záznamy.</small>'; return; }
+  const rows = items.map(r=>`
+    <tr>
+      <td><small>${r.timestamp.replace('T',' ').slice(0,16)}</small></td>
+      <td><span class="badge">${r.category}</span></td>
+      <td>${escapeHtml(r.content)}</td>
+    </tr>
+  `).join('');
+  $('list').innerHTML = `
+    <table>
+      <thead><tr><th>Čas</th><th>Kategória</th><th>Obsah</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  `;
+}
+function escapeHtml(s){ return s.replace(/[&<>"']/g, m=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[m])); }
+</script>
+</body></html>
     """
