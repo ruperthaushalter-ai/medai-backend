@@ -7,36 +7,49 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey
+from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
+
 # ---------- KONFIG ----------
 API_KEY = os.getenv("API_KEY", "m3dAI_7YtgqY2WJr9vQdXz")
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("Chýba DATABASE_URL (Railway → Variables).")
 
-app = FastAPI(title="MedAI 2.3 (all-in-one)")
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+Base = declarative_base()
+
+app = FastAPI(title="MedAI 2.3 (DB)")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 def require_api_key(x_api_key: str = Header(default=None)):
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-# ---------- „DB“ v pamäti (jednoduché demo) ----------
-patients = {}          # uid -> dict
-records = {}           # uid -> list[dict]
+# ---------- DB MODELY ----------
+class Patient(Base):
+    __tablename__ = "patients"
+    id = Column(Integer, primary_key=True)
+    patient_uid = Column(String(64), unique=True, index=True, nullable=False)
+    first_name = Column(String(120))
+    last_name = Column(String(120))
+    gender = Column(String(8), default="U")
+    created_at = Column(DateTime, default=datetime.utcnow)
+    records = relationship("Record", back_populates="patient", cascade="all, delete-orphan")
 
-# ---------- Heuristika kategórií ----------
-def detect_category(text: str) -> str:
-    t = (text or "").lower()
-    if any(x in t for x in ["crp", "hb", "leu", "mg/l", "mmol", "gluk"]):
-        return "LAB"
-    if any(x in t for x in ["ekg", "fibril", "tachy", "brady"]):
-        return "EKG"
-    if any(x in t for x in ["rtg", "rentgen", "infiltr", "pneumon"]):
-        return "RTG"
-    if any(x in t for x in ["podan", "lieč", "infuz", "antibio", "ceftriax", "amoxicil"]):
-        return "THERAPY"
-    if any(x in t for x in ["tlak", "puls", "dych", "teplota"]):
-        return "VITALS"
-    return "NOTE"
+class Record(Base):
+    __tablename__ = "records"
+    id = Column(Integer, primary_key=True)
+    patient_id = Column(Integer, ForeignKey("patients.id"), index=True, nullable=False)
+    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
+    category = Column(String(32), default="NOTE")
+    content = Column(Text, nullable=False)
+    patient = relationship("Patient", back_populates="records")
 
-# ---------- Schémy ----------
+Base.metadata.create_all(bind=engine)
+
+# ---------- Pydantic vstupy ----------
 class PatientIn(BaseModel):
     patient_uid: str
     first_name: str
@@ -48,39 +61,65 @@ class RecordIn(BaseModel):
     category: Optional[str] = None
     content: str
 
+# ---------- Heuristika kategórií ----------
+def detect_category(text: str) -> str:
+    t = (text or "").lower()
+    if any(x in t for x in ["crp", "hb", "leu", "mg/l", "mmol", "gluk"]): return "LAB"
+    if any(x in t for x in ["ekg", "fibril", "tachy", "brady"]): return "EKG"
+    if any(x in t for x in ["rtg", "rentgen", "infiltr", "pneumon"]): return "RTG"
+    if any(x in t for x in ["podan", "lieč", "infuz", "antibio", "ceftriax", "amoxicil"]): return "THERAPY"
+    if any(x in t for x in ["tlak", "puls", "dych", "teplota"]): return "VITALS"
+    return "NOTE"
+
+# ---------- DB session helper ----------
+def get_db() -> Session:
+    db = SessionLocal()
+    try: yield db
+    finally: db.close()
+
 # ---------- API ----------
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 @app.post("/patients", dependencies=[Depends(require_api_key)])
-def create_patient(body: PatientIn):
+def create_patient(body: PatientIn, db: Session = Depends(get_db)):
     uid = body.patient_uid.strip()
-    patients[uid] = {"patient_uid": uid, "first_name": body.first_name.strip(),
-                     "last_name": body.last_name.strip(), "gender": (body.gender or "U").upper()}
-    records.setdefault(uid, [])
+    exists = db.query(Patient).filter(Patient.patient_uid == uid).first()
+    if not exists:
+        p = Patient(
+            patient_uid=uid,
+            first_name=body.first_name.strip(),
+            last_name=body.last_name.strip(),
+            gender=(body.gender or "U").upper()
+        )
+        db.add(p); db.commit(); db.refresh(p)
     return {"status": "ok", "patient_uid": uid}
 
 @app.get("/patients", dependencies=[Depends(require_api_key)])
-def list_patients():
-    return list(patients.values())
+def list_patients(db: Session = Depends(get_db)):
+    pts = db.query(Patient).order_by(Patient.created_at.desc()).all()
+    return [{"patient_uid": p.patient_uid, "first_name": p.first_name, "last_name": p.last_name} for p in pts]
 
 @app.get("/patients/{uid}/records", dependencies=[Depends(require_api_key)])
-def list_records(uid: str):
-    if uid not in records:
-        raise HTTPException(404, "Patient not found")
-    return records[uid]
+def list_records(uid: str, db: Session = Depends(get_db)):
+    p = db.query(Patient).filter(Patient.patient_uid == uid).first()
+    if not p: raise HTTPException(404, "Patient not found")
+    recs = (db.query(Record)
+            .filter(Record.patient_id == p.id)
+            .order_by(Record.timestamp.asc(), Record.id.asc())
+            .all())
+    return [{"timestamp": r.timestamp.isoformat(), "category": r.category, "content": r.content} for r in recs]
 
 @app.post("/patients/{uid}/records", dependencies=[Depends(require_api_key)])
-def add_record(uid: str, body: RecordIn):
-    if uid not in records:
-        raise HTTPException(404, "Patient not found")
-    ts = body.timestamp or datetime.utcnow().isoformat()
+def add_record(uid: str, body: RecordIn, db: Session = Depends(get_db)):
+    p = db.query(Patient).filter(Patient.patient_uid == uid).first()
+    if not p: raise HTTPException(404, "Patient not found")
+    ts = datetime.fromisoformat(body.timestamp) if body.timestamp else datetime.utcnow()
     cat = body.category or detect_category(body.content)
-    rec = {"timestamp": ts, "category": cat, "content": body.content.strip()}
-    records[uid].append(rec)
-    records[uid].sort(key=lambda r: r["timestamp"])
-    return {"status": "ok", "saved": rec}
+    r = Record(patient_id=p.id, timestamp=ts, category=cat, content=body.content.strip())
+    db.add(r); db.commit(); db.refresh(r)
+    return {"status": "ok", "saved": {"timestamp": r.timestamp.isoformat(), "category": r.category, "content": r.content}}
 
 # Import textu alebo súboru (vyžaduje python-multipart v requirements.txt)
 @app.post("/import", dependencies=[Depends(require_api_key)])
@@ -88,26 +127,26 @@ async def import_data(
     patient_uid: str = Form(...),
     text: str = Form(None),
     file: UploadFile = File(None),
+    db: Session = Depends(get_db),
 ):
-    if patient_uid not in patients:
-        raise HTTPException(404, "Patient not found")
+    p = db.query(Patient).filter(Patient.patient_uid == patient_uid).first()
+    if not p: raise HTTPException(404, "Patient not found")
     content = ""
     if file:
         content = (await file.read()).decode("utf-8", errors="ignore")
     else:
         content = text or ""
-    if not content.strip():
-        raise HTTPException(400, "Empty import content")
+    if not content.strip(): raise HTTPException(400, "Empty import content")
     cat = detect_category(content)
-    rec = {"timestamp": datetime.utcnow().isoformat(), "category": cat, "content": content.strip()}
-    records.setdefault(patient_uid, []).append(rec)
+    r = Record(patient_id=p.id, timestamp=datetime.utcnow(), category=cat, content=content.strip())
+    db.add(r); db.commit(); db.refresh(r)
     return {"status": "imported", "patient_uid": patient_uid, "category": cat}
 
 # ---------- UI (vložený HTML+JS) ----------
 HTML = r"""
 <!doctype html><html lang="sk"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>MedAI Dashboard 2.3</title>
+<title>MedAI Dashboard 2.3 (DB)</title>
 <style>
 body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;background:#f6f8fb;margin:0}
 .header{background:#134a9a;color:#fff;padding:14px 18px;display:flex;gap:12px;align-items:center}
@@ -125,7 +164,7 @@ small{color:#666}
 </style>
 </head><body>
 <div class="header">
-  <b>MedAI Dashboard 2.3</b>
+  <b>MedAI Dashboard 2.3 (DB)</b>
   <input id="apiKey" placeholder="API Key">
   <span id="status" class="badge">offline</span>
 </div>
@@ -196,15 +235,14 @@ async function createPatient(){
     if(!res.ok){ throw new Error(await res.text()); }
     $('msg').innerHTML = '<span class="ok">Pacient uložený ('+uid+')</span>';
     localStorage.setItem('lastUID', uid);
-    await loadPatients();
-    await loadRecords();
+    await loadPatients(); await loadRecords();
   }catch(e){ $('msg').innerHTML = '<span class="err">Chyba: '+e.message+'</span>'; }
 }
 
 async function loadPatients(){
   try{
     const res = await api('/patients'); const data = await res.json();
-    if(!Array.isArray(data)){ $('plist').innerHTML=''; return; }
+    if(!Array.isArray(data) || !data.length){ $('plist').innerHTML='<small>Žiadni pacienti.</small>'; return; }
     const rows = data.map(p=>`<li>${p.patient_uid} — ${p.first_name} ${p.last_name}</li>`).join('');
     $('plist').innerHTML = '<ul>'+rows+'</ul>';
   }catch(e){ $('plist').innerHTML = '<span class="err">Chyba: '+e.message+'</span>'; }
@@ -232,10 +270,8 @@ async function saveRecord(){
   const raw = $('content').value.trim();
   if(!raw){ $('msg').innerHTML = '<span class="err">Prázdny obsah.</span>'; return; }
 
-  // Ak je JSON, vyťaží čas/kategóriu; inak pošle len text
   let payload = { content: raw };
-  try{
-    const j = JSON.parse(raw);
+  try{ const j = JSON.parse(raw);
     payload = { content: j.content || raw, category: j.category || null, timestamp: j.timestamp || null };
   }catch(_){}
 
@@ -263,7 +299,9 @@ async function doImport(){
     const d = await res.json();
     $('imp_msg').innerHTML = '<span class="ok">Import OK ('+d.category+')</span>';
     await loadRecords();
-  }catch(e){ $('imp_msg').innerHTML = '<span class="err">Chyba: '+e.message+'</span>'; }
+  }catch(e){
+    $('imp_msg').innerHTML = '<span class="err">Chyba: '+e.message+'</span>';
+  }
 }
 
 function escapeHtml(s){return s.replace(/[&<>"']/g, m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
