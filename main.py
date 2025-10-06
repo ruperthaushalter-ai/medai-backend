@@ -3,9 +3,9 @@ from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from datetime import datetime
-import os
+import os, json
 
-app = FastAPI(title="MedAI Dashboard 2.4")
+app = FastAPI(title="MedAI Dashboard 2.3")
 
 API_KEY = os.getenv("API_KEY", "m3dAI_7YtqgY2WJr9vQdXz")
 
@@ -16,7 +16,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ===== MODELY =====
+# ====== MODELY ======
 class Patient(BaseModel):
     patient_uid: str
     first_name: str | None = None
@@ -31,7 +31,7 @@ class Record(BaseModel):
 patients = {}
 records = {}
 
-# ===== DETEKCIA KATEGÓRIE =====
+# ====== AUTOMATICKÁ DETEKCIA KATEGÓRIE ======
 def detect_category(content):
     text = str(content).lower()
     if any(k in text for k in ["crp", "hb", "alt", "ast", "value", "mg/l", "mmol", "g/l"]):
@@ -47,7 +47,7 @@ def detect_category(content):
     else:
         return "NOTE"
 
-# ===== API =====
+# ====== API ENDPOINTY ======
 @app.get("/health")
 def health(): return {"status": "OK"}
 
@@ -69,7 +69,7 @@ def create_patient(request: Request, p: Patient):
 def get_records(uid: str, request: Request):
     if request.headers.get("X-API-Key") != API_KEY:
         raise HTTPException(403, "Invalid API Key")
-    return sorted(records.get(uid, []), key=lambda r: r["timestamp"])
+    return records.get(uid, [])
 
 @app.post("/patients/{uid}/records")
 def add_record(uid: str, request: Request, r: Record):
@@ -77,49 +77,46 @@ def add_record(uid: str, request: Request, r: Record):
         raise HTTPException(403, "Invalid API Key")
     if uid not in records:
         raise HTTPException(404, "Patient not found")
+
+    # automatická kategorizácia
     if not r.category:
         r.category = detect_category(r.content)
+
     records[uid].append(r.dict())
     return {"status": "added", "detected_category": r.category}
 
-# ===== AI ANALÝZA =====
+# ====== HEURISTICKÁ AI ======
 @app.get("/ai/summary/{uid}")
 def ai_summary(uid: str, request: Request):
     if request.headers.get("X-API-Key") != API_KEY:
         raise HTTPException(403, "Invalid API Key")
-    recs = sorted(records.get(uid, []), key=lambda r: r["timestamp"])
+    recs = records.get(uid, [])
     if not recs:
         return {"discharge_draft": "Žiadne dáta."}
+
     days = len(set(r["timestamp"][:10] for r in recs))
     labs = [r for r in recs if r["category"] == "LAB"]
     diag = []
-    if any("crp" in str(r["content"]).lower() for r in labs): diag.append("Infekcia?")
-    if any("alt" in str(r["content"]).lower() for r in labs): diag.append("Hepatopatia?")
-    if any("hb" in str(r["content"]).lower() for r in labs): diag.append("Anémia?")
-    timeline = "\n".join([f"{r['timestamp'][:10]} [{r['category']}] – {r['content']}" for r in recs])
+    if any("crp" in str(r["content"]).lower() for r in labs): diag.append("infekcia?")
+    if any("alt" in str(r["content"]).lower() for r in labs): diag.append("hepatopatia?")
+    if any("hb" in str(r["content"]).lower() for r in labs): diag.append("anémia?")
+
     summary = f"""
-🩺 Chronologická epikríza:
-
-{timeline}
-
-----------------------------
-📋 Súhrn hospitalizácie:
 Pacient mal {len(recs)} záznamov počas {days} dní hospitalizácie.
 Z toho {len(labs)} laboratórnych vyšetrení.
 AI detegovala možné diagnózy: {', '.join(diag) if diag else 'bez abnormít'}.
-"""
+    """
     return {"discharge_draft": summary}
 
-# ===== FRONTEND =====
+# ====== FRONTEND DASHBOARD ======
 @app.get("/", response_class=HTMLResponse)
 def ui():
     return """
     <html>
     <head>
-        <title>MedAI Dashboard 2.4</title>
+        <title>MedAI Dashboard 2.3</title>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-        <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
         <style>
             body { font-family: 'Inter', sans-serif; background:#f4f6fa; color:#111; margin:0; }
             header { background:#1e4e9a; color:white; padding:10px 20px; display:flex; justify-content:space-between; align-items:center; }
@@ -127,12 +124,13 @@ def ui():
             .panel { background:white; border-radius:8px; margin:8px; padding:12px; flex:1; min-width:320px; box-shadow:0 2px 6px rgba(0,0,0,0.1);}
             input, textarea { width:100%; margin:5px 0; padding:6px; border:1px solid #ccc; border-radius:4px; }
             button { background:#1e4e9a; color:white; border:none; padding:6px 12px; border-radius:5px; cursor:pointer; }
+            h3 { margin-top:0; }
             pre { white-space: pre-wrap; background:#f0f0f0; padding:10px; border-radius:6px; }
         </style>
     </head>
     <body>
         <header>
-            <h2>🏥 MedAI Dashboard 2.4</h2>
+            <h2>🧠 MedAI Dashboard 2.3</h2>
             <input id="apiKey" placeholder="API Key" style="width:250px;">
         </header>
 
@@ -157,15 +155,15 @@ def ui():
             </div>
 
             <div class="panel">
-                <h3>Epikríza a AI</h3>
-                <button onclick="generateAI()">🧠 Vytvoriť epikrízu</button>
-                <button onclick="exportPDF()">📄 Exportovať PDF</button>
+                <h3>AI Analýza</h3>
+                <button onclick="generateAI()">🧠 Analyzovať</button>
                 <pre id="ai"></pre>
+                <canvas id="chartDiv"></canvas>
             </div>
         </div>
 
         <script>
-        let selected=null, latest='';
+        let selected=null;
         async function loadPatients(){
             const key=document.getElementById('apiKey').value;
             const res=await fetch('/patients',{headers:{'X-API-Key':key}});
@@ -186,14 +184,16 @@ def ui():
             const res=await fetch(`/patients/${uid}/records`,{headers:{'X-API-Key':key}});
             const data=await res.json();
             let html='';
-            data.forEach(r=> html+=`<b>${r.category}</b> (${r.timestamp.slice(0,10)}): ${JSON.stringify(r.content)}<hr>`);
+            data.forEach(r=> html+=`<b>${r.category}</b>: ${JSON.stringify(r.content)}<hr>`);
             document.getElementById('records').innerHTML=html;
+            renderChart(data);
         }
         async function addRecord(){
             if(!selected){alert("Vyber pacienta");return;}
             const key=document.getElementById('apiKey').value;
             let contentVal=document.getElementById('content').value;
-            let parsed; try{parsed=JSON.parse(contentVal);}catch{parsed=contentVal;}
+            let parsed;
+            try{parsed=JSON.parse(contentVal);}catch{parsed=contentVal;}
             const body={timestamp:new Date().toISOString(),content:parsed};
             const res=await fetch(`/patients/${selected}/records`,{method:'POST',headers:{'X-API-Key':key,'Content-Type':'application/json'},body:JSON.stringify(body)});
             const out=await res.json();
@@ -204,14 +204,15 @@ def ui():
             const key=document.getElementById('apiKey').value;
             const res=await fetch(`/ai/summary/${selected}`,{headers:{'X-API-Key':key}});
             const data=await res.json();
-            latest=data.discharge_draft;
             document.getElementById('ai').textContent=data.discharge_draft;
         }
-        function exportPDF(){
-            if(!latest){alert('Najprv vytvor epikrízu');return;}
-            const element=document.createElement('div');
-            element.innerHTML='<h2>Prepúšťacia správa</h2><pre>'+latest+'</pre>';
-            html2pdf().from(element).save(`epikriza_${selected}.pdf`);
+        function renderChart(data){
+            const ctx=document.getElementById('chartDiv');
+            const labs=data.filter(r=>r.category==="LAB" && r.content.value);
+            if(!labs.length)return;
+            const labels=labs.map(r=>new Date(r.timestamp).toLocaleDateString());
+            const values=labs.map(r=>r.content.value);
+            new Chart(ctx,{type:'line',data:{labels:labels,datasets:[{label:'Laboratórny trend',data:values,borderColor:'#1e4e9a',fill:false}]}});
         }
         </script>
     </body>
